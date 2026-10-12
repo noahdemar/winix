@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>winix API reference</title>
+<meta name="description" content="Reference for the winix JavaScript API, the guest curl command, and the .winix session format.">
+<style>
+  :root {
+    --bg: #fbfbfa; --fg: #1c1c1a; --muted: #8a8a85; --line: #e6e5e1; --accent: #2f6f4f;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121211; --fg: #e8e7e3; --muted: #7d7c77; --line: #262624; --accent: #7cc59b; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); }
+  body { font: 15px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 820px; margin: 0 auto; padding: 40px 16px 64px; }
+  h1 { font: 600 22px/1.2 var(--mono); margin: 0 0 6px; }
+  h2 { font: 600 17px/1.3 var(--mono); margin: 40px 0 10px; padding-top: 16px; border-top: 1px solid var(--line); }
+  h3 { font: 600 14px/1.3 var(--mono); margin: 24px 0 6px; }
+  p, li { color: var(--fg); }
+  .lede, .note { color: var(--muted); }
+  a { color: var(--accent); }
+  code { font-family: var(--mono); font-size: 13px; }
+  pre { background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; overflow-x: auto; font: 13px/1.5 var(--mono); }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0 16px; font-size: 14px; }
+  th, td { text-align: left; vertical-align: top; padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; }
+  td code, th code { white-space: nowrap; }
+  nav a { margin-right: 12px; font: 13px var(--mono); }
+</style>
+<main>
+  <p><a href="index.html">← winix</a></p>
+  <h1>API reference</h1>
+  <p class="lede">winix runs a Linux kernel and its userland in the browser. This page describes the JavaScript API
+    (<code>winix.js</code>), the <code>curl</code> command inside the guest, and the <code>.winix</code> session format.
+    The reference matches the source as of this release.</p>
+  <nav>
+    <a href="#boot">Boot</a><a href="#exec">exec</a><a href="#files">Files</a><a href="#keys">keyInput</a>
+    <a href="#sessions">Sessions</a><a href="#lifecycle">Lifecycle</a><a href="#fetch">Network</a>
+    <a href="#curl">curl</a><a href="#format">Session format</a><a href="#not-yet">Not yet</a>
+  </nav>
+
+  <h2 id="boot">Boot</h2>
+  <pre><code>import { Winix, proxyFetch } from './winix.js';
+
+const w = await Winix.boot({ fetch: proxyFetch() });</code></pre>
+  <p><code>Winix.boot(options)</code> starts a machine and resolves to a <code>Winix</code> instance. In our tests, boot took
+    under a second. If the kernel panics during boot, it is retried a few times.</p>
+  <table>
+    <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+    <tr><td><code>baseUrl</code></td><td>the module's folder</td><td>Where the kernel, initramfs and <code>linux.js</code> are loaded from.</td></tr>
+    <tr><td><code>variant</code></td><td><code>'wasm32_nommu'</code></td><td>Build variant. Only this one is shipped.</td></tr>
+    <tr><td><code>onLog</code></td><td>none</td><td>Receives host diagnostics (boot messages and runtime events).</td></tr>
+    <tr><td><code>onConsole</code></td><td>none</td><td>Receives the guest console text, as it is printed.</td></tr>
+    <tr><td><code>cmdline</code></td><td>built-in</td><td>Kernel command line.</td></tr>
+    <tr><td><code>fetch</code></td><td>the page's <code>fetch</code></td><td>Function used for every HTTP request the guest makes. See <a href="#fetch">Network</a>.</td></tr>
+  </table>
+
+  <h2 id="exec">exec</h2>
+  <pre><code>const r = await w.exec('echo hi; ls /bin | wc -l', { cwd: '/work', env: { FOO: '1' }, timeoutMs: 60000 });
+// r = { stdout, stderr, exitCode, timedOut, truncated, durationMs }</code></pre>
+  <p><code>exec(command, options)</code> runs <code>command</code> with <code>sh -c</code> in the guest and resolves to:</p>
+  <table>
+    <tr><th>Field</th><th>Meaning</th></tr>
+    <tr><td><code>stdout</code>, <code>stderr</code></td><td>Output as UTF-8 text.</td></tr>
+    <tr><td><code>exitCode</code></td><td>Exit status. <code>-1</code> if the machine stopped answering.</td></tr>
+    <tr><td><code>timedOut</code></td><td><code>true</code> if the command ran past <code>timeoutMs</code>. Its process group is killed.</td></tr>
+    <tr><td><code>truncated</code></td><td><code>true</code> if output was longer than <code>maxOutputBytes</code>. The output is cut, not the command.</td></tr>
+    <tr><td><code>durationMs</code></td><td>Wall-clock time for the call, in milliseconds.</td></tr>
+  </table>
+  <table>
+    <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+    <tr><td><code>cwd</code></td><td><code>'/work'</code></td><td>Working directory.</td></tr>
+    <tr><td><code>env</code></td><td><code>{}</code></td><td>Environment variables. Names must match <code>[A-Za-z_][A-Za-z0-9_]*</code>.</td></tr>
+    <tr><td><code>timeoutMs</code></td><td><code>60000</code></td><td>Time limit for the command.</td></tr>
+    <tr><td><code>maxOutputBytes</code></td><td><code>1048576</code></td><td>Output limit for each of stdout and stderr.</td></tr>
+  </table>
+  <p class="note">Calls run one at a time, in the order they were made. The filesystem persists between calls. Shell
+    variables and working directory changes do not: each call is a new <code>sh -c</code>.</p>
+
+  <h2 id="files">Files</h2>
+  <pre><code>await w.writeFile('/work/a.js', 'console.log(6 * 7)');   // string is written as UTF-8
+await w.writeFile('/work/data.bin', bytes, { mode: 0o600 });
+const text  = await w.readFile('/work/a.js', { encoding: 'utf8' });
+const bytes = await w.readFile('/work/data.bin');           // Uint8Array</code></pre>
+  <table>
+    <tr><th>Method</th><th>Meaning</th></tr>
+    <tr><td><code>writeFile(path, data, { mode })</code></td><td>Writes a string (as UTF-8) or bytes. Creates parent directories. Default mode <code>0o644</code>.</td></tr>
+    <tr><td><code>readFile(path, { encoding })</code></td><td>Returns a <code>Uint8Array</code>, or a string with <code>encoding: 'utf8'</code>.</td></tr>
+  </table>
+
+  <h2 id="keys">keyInput</h2>
+  <p><code>w.keyInput(text)</code> types text into the guest console, as a keyboard would. It is not queued and does not
+    wait for the result. Use <code>exec</code> for anything that needs output. It is for interactive programs
+    (<code>vi</code>, <code>top</code>) and for the terminal page.</p>
+
+  <h2 id="sessions">Sessions</h2>
+  <pre><code>const blob = await w.exportSession({ hostState: { notes: 'anything JSON' }, onProgress: (p) => {} });
+
+const w2 = await Winix.restoreSession(blob, { fetch: proxyFetch() });
+w2.hostState; // the object saved above</code></pre>
+  <table>
+    <tr><th>Member</th><th>Meaning</th></tr>
+    <tr><td><code>exportSession({ hostState, onProgress })</code></td><td>Saves the root filesystem as a <code>.winix</code> Blob. Queued like <code>exec</code>. <code>hostState</code> is plain JSON that is stored with the session and returned as <code>hostState</code> when it is restored.</td></tr>
+    <tr><td><code>Winix.restoreSession(input, { onProgress, ...bootOptions })</code></td><td>Validates the archive, boots a new machine, and restores the filesystem. Returns the new instance. Your existing instances are not changed.</td></tr>
+    <tr><td><code>hostState</code> (getter)</td><td>A copy of the host state restored with this session, or <code>null</code>.</td></tr>
+  </table>
+  <p class="note">A session saves files only. Running programs, shell variables, terminal state, and editor buffers are
+    not saved. Stop background writers and save editors before exporting. The filesystem is not frozen during the save:
+    the save checks it before and after reading and fails if anything changed. Session files can contain secrets such as
+    <code>.env</code> files and keys.</p>
+  <p class="note">A session can only be restored into the same build of winix. Restoring checks the kernel and initramfs
+    checksums and refuses a different build.</p>
+
+  <h2 id="lifecycle">Lifecycle</h2>
+  <table>
+    <tr><th>Method</th><th>Meaning</th></tr>
+    <tr><td><code>reset()</code></td><td>Replaces the machine with a freshly booted one. The filesystem is lost.</td></tr>
+    <tr><td><code>dispose()</code></td><td>Stops the machine. Later calls fail with <code>Winix disposed</code>.</td></tr>
+  </table>
+
+  <h2 id="fetch">Network</h2>
+  <p>The guest has no sockets. Every HTTP request it makes is passed to the <code>fetch</code> function you give to
+    <code>boot()</code>. That function decides what happens to the request: it can forward it, log it, or refuse it.
+    Requests are made with the page's origin and browser credentials, so treat that function as a security boundary.</p>
+  <pre><code>import { Winix } from './winix.js';
+
+const allowed = ['example.com', 'api.example.org'];
+const w = await Winix.boot({
+  fetch: (url, init) => {
+    console.log('sandbox request:', init?.method, url);             // log
+    if (!allowed.includes(new URL(url).hostname)) {
+      return new Response('blocked by page policy', { status: 403 }); // block
+    }
+    return fetch(url, init);                                          // allow
+  },
+});</code></pre>
+  <p><code>proxyFetch(prefix)</code> is a ready-made <code>fetch</code> for cross-origin requests. It sends them to
+    <code>prefix + encodeURIComponent(url)</code>, which by default is <code>/__proxy?url=</code>. That route exists only on the
+    development server. The GitHub Pages site has no proxy, so cross-origin requests fail there. To run your own,
+    point <code>proxyFetch</code> at it, for example <code>proxyFetch('https://proxy.example/?url=')</code>. A proxy that
+    forwards any URL is an open relay, so restrict it to the hosts you need.</p>
+
+  <h2 id="curl">curl</h2>
+  <p>Inside the guest, <code>curl</code> performs HTTP and HTTPS requests through the <code>fetch</code> function above.
+    The flags it accepts:</p>
+  <table>
+    <tr><th>Flags</th><th>Meaning</th></tr>
+    <tr><td><code>-s</code>, <code>--silent</code> / <code>-S</code>, <code>--show-error</code></td><td>Hide progress; show errors when silent.</td></tr>
+    <tr><td><code>-f</code>, <code>--fail</code> / <code>--fail-with-body</code></td><td>Exit 22 on HTTP status 400 and above (the second also prints the body).</td></tr>
+    <tr><td><code>-i</code>, <code>--include</code> / <code>-I</code>, <code>--head</code></td><td>Print response headers, or send only a HEAD request.</td></tr>
+    <tr><td><code>-N</code>, <code>--no-buffer</code></td><td>Accepted for compatibility. Response bodies are already written as they arrive, so streaming (for example server-sent events) works without it.</td></tr>
+    <tr><td><code>-o FILE</code>, <code>--output FILE</code> / <code>-O</code>, <code>--remote-name</code></td><td>Write the body to a file, or to a file named after the URL.</td></tr>
+    <tr><td><code>-X METHOD</code>, <code>--request METHOD</code></td><td>HTTP method.</td></tr>
+    <tr><td><code>-H HEADER</code>, <code>--header HEADER</code></td><td>Add a request header.</td></tr>
+    <tr><td><code>-d DATA</code>, <code>--data</code>, <code>--data-raw</code>, <code>--data-binary</code></td><td>Request body. <code>@file</code> reads a file, <code>@-</code> reads stdin (not with <code>--data-raw</code>).</td></tr>
+    <tr><td><code>-A UA</code>, <code>--user-agent UA</code></td><td>Set the User-Agent header.</td></tr>
+    <tr><td><code>-w FORMAT</code>, <code>--write-out FORMAT</code></td><td>Print after the transfer. Supports <code>%{http_code}</code> and <code>\n</code>.</td></tr>
+    <tr><td><code>-L</code>, <code>-k</code>, <code>--location</code>, <code>--compressed</code></td><td>Accepted. Redirects are always followed.</td></tr>
+  </table>
+  <p class="note">Anything else is an error. Sockets, <code>ssh</code>, <code>nc</code>, and <code>ping</code> are not
+    available in this release.</p>
+
+  <h2 id="format">Session format</h2>
+  <p>A <code>.winix</code> file is gzip-compressed. Once decompressed, it holds the magic string <code>WINIXS01</code>,
+    a 32-bit little-endian manifest length, the SHA-256 of the manifest, a JSON manifest, and then the bytes of every
+    regular file in manifest order. Checksums detect corruption; they do not prove where a file came from, so restore
+    only archives you trust. Nothing in the archive runs as code: it is validated before any machine starts.</p>
+
+  <h2 id="not-yet">Not yet</h2>
+  <p>These are planned but not part of this release: network sockets inside the guest, <code>w.connect()</code>, and
+    <code>w.ping()</code>. Raw networking needs a kernel build with networking enabled and a process outside the browser
+    to carry the traffic.</p>
+</main>
