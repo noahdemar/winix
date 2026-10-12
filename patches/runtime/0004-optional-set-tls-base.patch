@@ -1,0 +1,30 @@
+diff --git a/runtime/linux-worker.js b/runtime/linux-worker.js
+index 9bfc3f6..bcd5617 100644
+--- a/runtime/linux-worker.js
++++ b/runtime/linux-worker.js
+@@ -187,7 +187,11 @@
+             if (user_executable_instance.exports.__libc_handle_signal) {
+               // Setup signal frame...
+               user_executable_imports.env.__stack_pointer.value = vmlinux_instance.exports.get_user_stack_pointer();
+-              user_executable_instance.exports.__set_tls_base(vmlinux_instance.exports.get_user_tls_base());
++              // __set_tls_base comes from libc's clone.S, so programs that never call clone() lack it; they are
++              // single-threaded and their TLS base never changes, so there is nothing to restore.
++              if (user_executable_instance.exports.__set_tls_base) {
++                user_executable_instance.exports.__set_tls_base(vmlinux_instance.exports.get_user_tls_base());
++              }
+ 
+               user_executable_instance.exports.__libc_handle_signal();
+               throw new Error("Wasm function __libc_handle_signal() returned (it should never return)!");
+@@ -198,7 +202,11 @@
+             if (error instanceof Trap && error.kind == "signal_return") {
+               // ...restore signal frame.
+               user_executable_imports.env.__stack_pointer.value = vmlinux_instance.exports.get_user_stack_pointer();
+-              user_executable_instance.exports.__set_tls_base(vmlinux_instance.exports.get_user_tls_base());
++              // __set_tls_base comes from libc's clone.S, so programs that never call clone() lack it; they are
++              // single-threaded and their TLS base never changes, so there is nothing to restore.
++              if (user_executable_instance.exports.__set_tls_base) {
++                user_executable_instance.exports.__set_tls_base(vmlinux_instance.exports.get_user_tls_base());
++              }
+             } else {
+               // Either a genuine error, or a Trap() from exec() (signal handlers are allowed to call exec()).
+               throw error;

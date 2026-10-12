@@ -50,7 +50,7 @@ for c in llvm kernel musl busybox; do
 done
 
 # Our patches (patches/<component>/*.patch) go on top of upstream's; skipped when already applied.
-for c in kernel busybox; do
+for c in kernel musl busybox; do
   for p in "$REPO"/patches/$c/*.patch; do
     [ -f "$p" ] || continue
     if git -C "$LW_WORKSPACE/src/$c" apply --reverse --check "$p" >/dev/null 2>&1; then continue; fi

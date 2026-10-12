@@ -34,7 +34,7 @@
 <script type="module">
   import { attachChannels, proxyFetch } from './winix.js';
 
-  const cmdline = 'maxcpus=1 nohz_full=0,2-63 rcu_nocbs=0,2-63 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0 quiet';
+  const cmdline = 'maxcpus=3 nohz_full=0,2-63 rcu_nocbs=0,2-63 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0 quiet';
   const variant = 'wasm32_nommu';
   const css = getComputedStyle(document.documentElement);
   const term = new Terminal({

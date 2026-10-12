@@ -1,0 +1,449 @@
+--- a/blink/blink.c
++++ b/blink/blink.c
+@@ -361,6 +361,10 @@
+ }
+ #endif
+ 
++#ifdef __wasm__
++_Noreturn void WinixRestore(int, int (*)(char *, char *, char **, char **));
++#endif
++
+ int main(int argc, char *argv[]) {
+   SetupWeb();
+   GetStartDir();
+@@ -379,6 +383,18 @@
+   g_blink_path = argc > 0 ? argv[0] : 0;
+   WriteErrorInit();
+   InitMap();
++#ifdef __wasm__
++  if (getenv("BLINK_WINIX_FORK")) {  // we are the child of a snapshot fork
++    char *fake[] = {argv[0], (char *)"-", 0};
++    int fd = atoi(getenv("BLINK_WINIX_FORK"));
++    unsetenv("BLINK_WINIX_FORK");
++    GetOpts(2, fake);
++    if (SetOverlays(FLAG_overlays, true)) exit(127);
++    HandleSigs();
++    InitBus();
++    WinixRestore(fd, Exec);
++  }
++#endif
+   GetOpts(argc, argv);
+   if (optind_ == argc) {
+     PrintUsage(argc, argv, 48, 2);
+--- a/blink/loader.c
++++ b/blink/loader.c
+@@ -204,10 +204,20 @@
+       // map the bulk of .text directly into memory without copying.
+       ELF_LOGF("load %" PRIx64 "-%" PRIx64 " from %" PRIx64 "-%" PRIx64, start,
+                start + bulk, offset, offset + bulk);
++#ifdef __wasm__
++      // NOMMU host: per-page private file mmap()s are unreliable (pages that
++      // two segments share), so use anonymous memory and copy the file bytes.
++      if (ReserveVirtual(s, start, bulk, key, -1, 0, 0, 0) == -1) {
++        ERRF("failed to allocate elf program header memory");
++        exit(127);
++      }
++      LoaderCopy(m, start, filesz, image, offset, prot);
++#else
+       if (ReserveVirtual(s, start, bulk, key, fd, offset, 0, 0) == -1) {
+         ERRF("failed to map elf program header file data");
+         exit(127);
+       }
++#endif
+       if ((amt = bulk - filesz)) {
+         ELF_LOGF("note: next copy is actually bzero() kludge");
+         unassert(blank = calloc(1, amt));
+@@ -830,7 +840,13 @@
+     VfsClose(fd);
+     return false;
+   }
++#ifdef __wasm__
++  // NOMMU: shared file mappings need physically contiguous page cache; a
++  // read-only private mapping (a copy) serves this peek just as well.
++  img = VfsMmap(0, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
++#else
+   img = VfsMmap(0, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
++#endif
+   VfsClose(fd);
+   if (img == MAP_FAILED) goto CantEmulate;
+   res = !!CanEmulateData(m, prog, argv, isfirst, (char *)img, st.st_size);
+--- a/blink/map.c
++++ b/blink/map.c
+@@ -98,6 +98,11 @@
+   int i;
+   void *ptr;
+   uint64_t want;
++#ifdef __wasm__
++  // NOMMU host: every fixed-address probe fails, and guest memory is never
++  // mapped linearly here, so assume the x86-64 layout.
++  return 47;
++#endif
+   for (i = 16; i < 40; ++i) {
+     want = UINT64_C(0x8123000000000000) >> i;
+     if (want > UINTPTR_MAX) continue;
+@@ -182,6 +187,10 @@
+ int Munmap(void *addr, size_t length) {
+   int rc;
+   rc = VfsMunmap(addr, length);
++#ifdef __wasm__
++  // NOMMU munmap() only takes whole mappings; blink frees sub-ranges. Leak them.
++  if (rc == -1 && errno == EINVAL) rc = 0;
++#endif
+ #if LOG_MEM
+   char szbuf[16];
+   FormatSize(szbuf, length, 1024);
+@@ -200,6 +209,11 @@
+              int prot,       //
+              const char *owner) {
+   int res = VfsMprotect(addr, length, prot);
++#ifdef __wasm__
++  // NOMMU host has no mprotect(); guest page permissions live in blink's own
++  // page tables (non-linear mode), so there is nothing to protect on the host.
++  if (res == -1 && errno == ENOSYS) res = 0;
++#endif
+ #if LOG_MEM
+   char szbuf[16];
+   FormatSize(szbuf, length, 1024);
+--- a/blink/memorymalloc.c
++++ b/blink/memorymalloc.c
+@@ -501,6 +501,13 @@
+     }
+     UNLOCK(&s->machines_lock);
+   }
++#else
++  // Without threads there is one machine; it must still drop stale TLB and
++  // opcache entries (upstream did nothing here, so mprotect never took effect).
++  if (g_machine) {
++    if (tlb) g_machine->invalidated = true;
++    if (icache) g_machine->opcache->invalidated = true;
++  }
+ #endif
+ }
+ 
+--- a/blink/syscall.c
++++ b/blink/syscall.c
+@@ -399,6 +399,10 @@
+ #endif
+ }
+ 
++#ifdef __wasm__
++static int WinixFork(struct Machine *, u64, u64, u64);
++#endif
++
+ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
+   int pid, newpid = 0;
+   _Atomic(int) *ctid_ptr;
+@@ -423,7 +427,11 @@
+     LOCK(&m->system->jit.lock);
+ #endif
+   }
++#ifdef __wasm__
++  pid = WinixFork(m, flags, stack, ctid);  // the parent side only
++#else
+   pid = fork();
++#endif
+ #ifdef __HAIKU__
+   // haiku wipes tls after fork() in child
+   // https://dev.haiku-os.org/ticket/17896
+@@ -5732,3 +5740,301 @@
+   CollectGarbage(m, mark);
+   m->insyscall = false;
+ }
++
++#ifdef __wasm__
++// fork() on a NOMMU host (winix). There is no MMU to copy a process with, but
++// the guest process is plain data here: registers plus blink's own page tables.
++// So a fork streams a snapshot of it through a pipe into a freshly exec'd blink,
++// which rebuilds it (WinixRestore) and resumes with rax=0. Host fds survive the
++// exec; guest close-on-exec flags are cleared around the spawn and restored on
++// both sides. vfork and clone(CLONE_VFORK) get the same copy semantics.
++#include <sched.h>
++
++#define WINIX_FORK_MAGIC 0x31464e5857ull
++
++static bool g_winix_bad;
++
++static void WinixPut(int fd, const void *p, size_t n) {
++  const u8 *b = (const u8 *)p;
++  while (n && !g_winix_bad) {
++    ssize_t k = write(fd, b, n);
++    if (k < 0 && errno == EINTR) continue;
++    if (k <= 0) {
++      g_winix_bad = true;
++      break;
++    }
++    b += k;
++    n -= k;
++  }
++}
++
++static void WinixGet(int fd, void *p, size_t n) {
++  u8 *b = (u8 *)p;
++  while (n && !g_winix_bad) {
++    ssize_t k = read(fd, b, n);
++    if (k < 0 && errno == EINTR) continue;
++    if (k <= 0) {
++      g_winix_bad = true;
++      memset(b, 0, n);
++      break;
++    }
++    b += k;
++    n -= k;
++  }
++}
++
++static void WinixPutStr(int fd, const char *s) {
++  u32 n = s ? strlen(s) + 1 : 0;
++  WinixPut(fd, &n, 4);
++  if (n) WinixPut(fd, s, n);
++}
++
++static char *WinixGetStr(int fd) {
++  u32 n;
++  char *s;
++  WinixGet(fd, &n, 4);
++  if (!n || g_winix_bad || !(s = (char *)malloc(n))) return 0;
++  WinixGet(fd, s, n);
++  s[n - 1] = 0;
++  return s;
++}
++
++u64 HandlePageFault(struct Machine *, u8 *, u64);
++
++// Every valid user-half leaf page: virt, permission key, and contents unless
++// the page is an untouched anonymous reservation (still zero). File-backed
++// reservations are mapped lazily on first touch, so fault them in first: the
++// child would otherwise see zeros where the file's bytes belong.
++static void WinixPutPages(struct Machine *m, int fd, u64 table, int level,
++                          i64 base) {
++  struct System *s = m->system;
++  int i;
++  u8 has, *t = GetPageAddress(s, table, level == 39);
++  for (i = 0; i < (level == 39 ? 256 : 512); ++i) {
++    u64 e = LoadPte(t + i * 8);
++    i64 virt = base + ((i64)i << level);
++    if (!(e & PAGE_V)) continue;
++    if (level > 12) {
++      WinixPutPages(m, fd, e, level - 9, virt);
++      continue;
++    }
++    if ((e & PAGE_RSRV) && (e & PAGE_MAP)) {
++      e = HandlePageFault(m, t + i * 8, e);
++      if (!(e & PAGE_V)) continue;
++    }
++    u64 key = e & (PAGE_U | PAGE_RW | PAGE_XD);
++    has = !(e & PAGE_RSRV);
++    WinixPut(fd, &virt, 8);
++    WinixPut(fd, &key, 8);
++    WinixPut(fd, &has, 1);
++    if (has) WinixPut(fd, GetPageAddress(s, e, false), 4096);
++  }
++}
++
++static void WinixSnapshot(struct Machine *m, int fd, u64 flags, u64 stack,
++                          u64 ctid) {
++  struct Dll *e;
++  struct System *s = m->system;
++  u64 magic = WINIX_FORK_MAGIC, n = 0, sigmask = m->sigmask;
++  i64 end = -1;
++  WinixPut(fd, &magic, 8);
++  WinixPut(fd, &flags, 8);
++  WinixPut(fd, &stack, 8);
++  WinixPut(fd, &ctid, 8);
++  // CPU
++  WinixPut(fd, &m->ip, sizeof(m->ip));
++  WinixPut(fd, &m->mode, sizeof(m->mode));
++  WinixPut(fd, &m->flags, sizeof(m->flags));
++  WinixPut(fd, m->beg, sizeof(m->beg));
++  WinixPut(fd, m->xmm, sizeof(m->xmm));
++  WinixPut(fd, m->seg, sizeof(m->seg));
++  WinixPut(fd, &m->fpu, sizeof(m->fpu));
++  WinixPut(fd, &m->mxcsr, sizeof(m->mxcsr));
++  WinixPut(fd, &sigmask, 8);
++  WinixPut(fd, &m->sigaltstack, sizeof(m->sigaltstack));
++  WinixPut(fd, &m->robust_list, sizeof(m->robust_list));
++  // process
++  WinixPut(fd, &s->mode, sizeof(s->mode));
++  WinixPut(fd, &s->brk, sizeof(s->brk));
++  WinixPut(fd, &s->automap, sizeof(s->automap));
++  WinixPut(fd, &s->codestart, sizeof(s->codestart));
++  WinixPut(fd, &s->codesize, sizeof(s->codesize));
++  WinixPut(fd, s->hands, sizeof(s->hands));
++  WinixPut(fd, &s->blinksigs, sizeof(s->blinksigs));
++  WinixPut(fd, s->rlim, sizeof(s->rlim));
++  WinixPut(fd, &s->exec_sigmask, sizeof(s->exec_sigmask));
++  WinixPut(fd, &s->elf.base, sizeof(s->elf) - offsetof(struct Elf, base));
++  WinixPutStr(fd, s->elf.prog);
++  WinixPutStr(fd, s->elf.execfn);
++  WinixPutStr(fd, s->elf.interpreter);
++  // file descriptors
++  for (e = dll_first(s->fds.list); e; e = dll_next(s->fds.list, e)) ++n;
++  WinixPut(fd, &n, 8);
++  for (e = dll_first(s->fds.list); e; e = dll_next(s->fds.list, e)) {
++    struct Fd *f = FD_CONTAINER(e);
++    WinixPut(fd, &f->fildes, sizeof(f->fildes));
++    WinixPut(fd, &f->oflags, sizeof(f->oflags));
++    WinixPut(fd, &f->socktype, sizeof(f->socktype));
++    WinixPutStr(fd, f->path);
++  }
++  // memory
++  WinixPutPages(m, fd, s->cr3, 39, 0);
++  WinixPut(fd, &end, 8);
++}
++
++struct WinixSpawn {
++  const char *path;
++  char **argv;
++  char **envp;
++};
++
++static int WinixSpawnChild(void *arg) {
++  struct WinixSpawn *w = (struct WinixSpawn *)arg;
++  execve(w->path, w->argv, w->envp);
++  _exit(127);
++}
++
++static int WinixFork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
++  static char self[PATH_MAX];
++  struct Dll *e;
++  struct WinixSpawn w;
++  char fdenv[32], **envp, *argv[] = {(char *)"blink", 0};
++  int p[2], pid, err, i, n = 0, nenv = 0, cleared[256];
++  if (!*self && !realpath("/proc/self/exe", self)) strcpy(self, "/usr/bin/blink");
++  if (pipe(p)) return -1;
++  fcntl(p[1], F_SETFD, FD_CLOEXEC);
++  for (e = dll_first(m->system->fds.list); e; e = dll_next(m->system->fds.list, e)) {
++    int fd = FD_CONTAINER(e)->fildes;
++    if (n < 256 && (fcntl(fd, F_GETFD) & FD_CLOEXEC) && !fcntl(fd, F_SETFD, 0)) {
++      cleared[n++] = fd;
++    }
++  }
++  while (environ[nenv]) ++nenv;
++  if (!(envp = (char **)calloc(nenv + 2, sizeof(char *)))) return -1;
++  memcpy(envp, environ, nenv * sizeof(char *));
++  snprintf(fdenv, sizeof(fdenv), "BLINK_WINIX_FORK=%d", p[0]);
++  envp[nenv] = fdenv;
++  w.path = self;
++  w.argv = argv;
++  w.envp = envp;
++#ifdef __wasm__
++  pid = clone(WinixSpawnChild, 0, CLONE_VM | CLONE_VFORK | SIGCHLD, &w);
++#else  // native test builds (-DWINIX_FORK): clone() needs a child stack
++  static char stk[65536] __attribute__((__aligned__(16)));
++  pid = clone(WinixSpawnChild, stk + sizeof(stk), CLONE_VM | CLONE_VFORK | SIGCHLD, &w);
++#endif
++  err = errno;
++  for (i = 0; i < n; ++i) fcntl(cleared[i], F_SETFD, FD_CLOEXEC);
++  free(envp);
++  close(p[0]);
++  if (pid < 0) {
++    close(p[1]);
++    errno = err;
++    return -1;
++  }
++  g_winix_bad = false;
++  WinixSnapshot(m, p[1], flags, stack, ctid);
++  if (g_winix_bad) LOGF("fork snapshot: %s", DescribeHostErrno(errno));
++  close(p[1]);
++  return pid;
++}
++
++_Noreturn void WinixRestore(int fd, int (*exec)(char *, char *, char **, char **)) {
++  struct Machine *m;
++  struct System *s;
++  u64 magic, flags, stack, ctid, n, i, key, sigmask;
++  i64 virt, pid;
++  u8 has, page[4096];
++  _Atomic(i32) *ctid_ptr;
++  unassert((g_machine = m = NewMachine(s = NewSystem(XED_MACHINE_MODE_LONG), 0)));
++  s->exec = exec;
++  s->cr0 = CR0_PE | CR0_MP | CR0_ET | CR0_PG;  // as LoadProgram() sets up paging
++  s->cr3 = AllocatePageTable(s);
++  g_winix_bad = false;
++  WinixGet(fd, &magic, 8);
++  if (magic != WINIX_FORK_MAGIC) {
++    WriteErrorString("blink: bad fork snapshot\n");
++    exit(127);
++  }
++  WinixGet(fd, &flags, 8);
++  WinixGet(fd, &stack, 8);
++  WinixGet(fd, &ctid, 8);
++  WinixGet(fd, &m->ip, sizeof(m->ip));
++  WinixGet(fd, &m->mode, sizeof(m->mode));
++  WinixGet(fd, &m->flags, sizeof(m->flags));
++  WinixGet(fd, m->beg, sizeof(m->beg));
++  WinixGet(fd, m->xmm, sizeof(m->xmm));
++  WinixGet(fd, m->seg, sizeof(m->seg));
++  WinixGet(fd, &m->fpu, sizeof(m->fpu));
++  WinixGet(fd, &m->mxcsr, sizeof(m->mxcsr));
++  WinixGet(fd, &sigmask, 8);
++  m->sigmask = sigmask;
++  WinixGet(fd, &m->sigaltstack, sizeof(m->sigaltstack));
++  WinixGet(fd, &m->robust_list, sizeof(m->robust_list));
++  WinixGet(fd, &s->mode, sizeof(s->mode));
++  WinixGet(fd, &s->brk, sizeof(s->brk));
++  WinixGet(fd, &s->automap, sizeof(s->automap));
++  WinixGet(fd, &s->codestart, sizeof(s->codestart));
++  WinixGet(fd, &s->codesize, sizeof(s->codesize));
++  WinixGet(fd, s->hands, sizeof(s->hands));
++  WinixGet(fd, &s->blinksigs, sizeof(s->blinksigs));
++  WinixGet(fd, s->rlim, sizeof(s->rlim));
++  WinixGet(fd, &s->exec_sigmask, sizeof(s->exec_sigmask));
++  WinixGet(fd, &s->elf.base, sizeof(s->elf) - offsetof(struct Elf, base));
++  s->elf.prog = WinixGetStr(fd);
++  s->elf.execfn = WinixGetStr(fd);
++  s->elf.interpreter = WinixGetStr(fd);
++  WinixGet(fd, &n, 8);
++  for (i = 0; i < n && !g_winix_bad; ++i) {
++    int fildes, oflags, socktype;
++    struct Fd *f;
++    char *path;
++    WinixGet(fd, &fildes, sizeof(fildes));
++    WinixGet(fd, &oflags, sizeof(oflags));
++    WinixGet(fd, &socktype, sizeof(socktype));
++    path = WinixGetStr(fd);
++    if ((f = AddFd(&s->fds, fildes, oflags))) {
++      f->socktype = socktype;
++      f->path = path;
++    }
++    if (oflags & O_CLOEXEC) fcntl(fildes, F_SETFD, FD_CLOEXEC);
++  }
++  for (;;) {
++    WinixGet(fd, &virt, 8);
++    if (virt == -1 || g_winix_bad) break;
++    WinixGet(fd, &key, 8);
++    WinixGet(fd, &has, 1);
++    if (ReserveVirtual(s, virt, 4096, PAGE_U | PAGE_RW, -1, 0, 0, 0) == -1) {
++      WriteErrorString("blink: fork: out of memory\n");
++      exit(127);
++    }
++    if (has) {
++      WinixGet(fd, page, 4096);
++      CopyToUser(m, virt, page, 4096);
++    }
++    if (key != (PAGE_U | PAGE_RW)) {
++      ProtectVirtual(s, virt, 4096, GetProtection(key), false);
++    }
++  }
++  close(fd);
++  if (g_winix_bad) {
++    WriteErrorString("blink: truncated fork snapshot\n");
++    exit(127);
++  }
++  pid = getpid();
++  m->tid = s->pid = pid;
++  s->isfork = true;
++  s->loaded = true;
++  if (stack) Put64(m->sp, stack);
++  if ((flags & (CLONE_CHILD_SETTID_LINUX | CLONE_CHILD_CLEARTID_LINUX)) &&
++      !(ctid & (sizeof(i32) - 1)) &&
++      (ctid_ptr = (_Atomic(i32) *)LookupAddress(m, ctid))) {
++    if (flags & CLONE_CHILD_SETTID_LINUX) {
++      atomic_store_explicit(ctid_ptr, Little32(pid), memory_order_release);
++    }
++    if (flags & CLONE_CHILD_CLEARTID_LINUX) m->ctid = ctid;
++  }
++  Put64(m->ax, 0);
++  Blink(m);
++}
++#endif /* __wasm__ */

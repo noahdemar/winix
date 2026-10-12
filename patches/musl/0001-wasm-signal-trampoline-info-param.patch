@@ -1,0 +1,12 @@
+diff --git a/src/signal/wasm/restore.S b/src/signal/wasm/restore.S
+index a3b2abf..a15a8a5 100644
+--- a/src/signal/wasm/restore.S
++++ b/src/signal/wasm/restore.S
+@@ -45,7 +45,6 @@ __libc_handle_signal:
+ 
+ 	/* info_param */
+ 	global.get __stack_pointer
+-	iLONG.const 4
+ 	INSN_32_64(i32.const 4, i64.const 8)
+ 	iLONG.add
+ 	iLONG.load 0

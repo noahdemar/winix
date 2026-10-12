@@ -239,6 +239,13 @@ echo "it's"`;
     eq(q.stdout, '6\n', 'sqlite ' + q.stderr);
     eq((await w.exec('apt list --installed')).stdout, 'sqlite/winix 3.47.2 wasm32 [installed]\n');
   }],
+  ['36b lua (setjmp/longjmp)', async () => {
+    eq((await w.exec('apt-get install -y lua', { timeoutMs: 60000 })).exitCode, 0);
+    eq((await w.exec(`lua -e 'print(("ok"):rep(2), 2^10)'`)).stdout, 'okok\t1024.0\n');
+    eq((await w.exec(`lua -e 'print(pcall(error, "boom"))'`)).stdout, 'false\tboom\n');
+    const r = await w.exec(`lua -e 'error("bad")'`);
+    eq(r.exitCode, 1); eq(r.stderr.includes('bad'), true, 'stderr ' + r.stderr);
+  }],
   ['37 apt unknown package, remove', async () => {
     const r = await w.exec('apt install -y nope');
     eq(r.exitCode, 100);
@@ -246,7 +253,40 @@ echo "it's"`;
     await w.exec('apt remove -y sqlite');
     eq((await w.exec('command -v sqlite3 || echo gone')).stdout, 'gone\n');
   }],
+  ['38 blink runs x86-64 code', async () => {
+    eq((await w.exec('apt-get install -y blink', { timeoutMs: 60000 })).exitCode, 0);
+    const msg = [...new TextEncoder().encode('hi from x86-64\n')];
+    // write(1, msg, len); exit(0)
+    const code = [0xb8, 1, 0, 0, 0, 0xbf, 1, 0, 0, 0, 0x48, 0x8d, 0x35, 16, 0, 0, 0, 0xba, msg.length, 0, 0, 0,
+      0x0f, 0x05, 0xb8, 60, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05, ...msg];
+    await w.writeFile('/work/hello.x86', x86Elf(code), { mode: 0o755 });
+    const r = await w.exec('blink /work/hello.x86');
+    eq(r.stdout, 'hi from x86-64\n', 'stderr ' + r.stderr); eq(r.exitCode, 0);
+  }],
+  ['39 blink snapshot fork + wait4', async () => {
+    // fork(); child: exit(7); parent: wait4(-1, &st, 0, 0); exit(WEXITSTATUS(st))
+    const code = [0xb8, 57, 0, 0, 0, 0x0f, 0x05, 0x85, 0xc0, 0x75, 12, 0xbf, 7, 0, 0, 0, 0xb8, 60, 0, 0, 0, 0x0f, 0x05,
+      0x48, 0x83, 0xec, 0x10, 0xbf, 0xff, 0xff, 0xff, 0xff, 0x48, 0x89, 0xe6, 0x31, 0xd2, 0x45, 0x31, 0xd2,
+      0xb8, 61, 0, 0, 0, 0x0f, 0x05, 0x8b, 0x04, 0x24, 0xc1, 0xe8, 0x08, 0x89, 0xc7, 0xb8, 60, 0, 0, 0, 0x0f, 0x05];
+    await w.writeFile('/work/fork.x86', x86Elf(code), { mode: 0o755 });
+    const r = await w.exec('blink /work/fork.x86', { timeoutMs: 20000 });
+    eq(r.exitCode, 7, 'stderr ' + r.stderr);
+  }],
 ];
+
+/// A minimal static x86-64 ELF: one R+X segment at 0x400000 holding `code`, entry at its start.
+function x86Elf(code) {
+  const hdr = 64 + 56, u = new Uint8Array(hdr + code.length), b = new DataView(u.buffer);
+  u.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0]);
+  b.setUint16(16, 2, true); b.setUint16(18, 62, true); b.setUint32(20, 1, true);
+  b.setBigUint64(24, BigInt(0x400000 + hdr), true); b.setBigUint64(32, 64n, true);
+  b.setUint16(52, 64, true); b.setUint16(54, 56, true); b.setUint16(56, 1, true);
+  b.setUint32(64, 1, true); b.setUint32(68, 5, true);
+  b.setBigUint64(80, 0x400000n, true); b.setBigUint64(88, 0x400000n, true);
+  b.setBigUint64(96, BigInt(u.length), true); b.setBigUint64(104, BigInt(u.length), true); b.setBigUint64(112, 0x1000n, true);
+  u.set(code, hdr);
+  return u;
+}
 
 for (const [name, fn] of cases) {
   const t = performance.now();

@@ -1,0 +1,14 @@
+diff --git a/runtime/linux-worker.js b/runtime/linux-worker.js
+index 1ba5e2f..9bfc3f6 100644
+--- a/runtime/linux-worker.js
++++ b/runtime/linux-worker.js
+@@ -442,6 +442,9 @@
+             __table_base: new WebAssembly.Global({ value: 'i' + arch_bits, mutable: false }, Ulong(user_executable_params.table_start)),
+             __table_base32: new WebAssembly.Global({ value: 'i32', mutable: false }, Number(user_executable_params.table_start)),
+ 
++            // Exception tag for programs built with wasm setjmp/longjmp support (thrown and caught within the program).
++            __c_longjmp: new WebAssembly.Tag({ parameters: ['i' + arch_bits] }),
++
+             // To be correct, we should save AND restore these globals between the user instance and vmlinux instance:
+             // __stack_pointer <-> __user_stack_pointer
+             // __tls_base <-> __user_tls_base

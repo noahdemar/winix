@@ -3,7 +3,7 @@
 // channels; their HTTP requests are made with the page's fetch (or the `fetch` passed to boot()).
 
 const BOOT_CMDLINE =
-  'maxcpus=1 nohz_full=0,2-63 rcu_nocbs=0,2-63 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0 quiet';
+  'maxcpus=3 nohz_full=0,2-63 rcu_nocbs=0,2-63 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0 quiet';
 const READY_TIMEOUT_MS = 30000;
 const BOOT_ATTEMPTS = 3;
 const BACKSTOP_MS = 15000; // host-side deadline beyond the in-guest timeout; resets the machine

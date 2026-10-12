@@ -223,8 +223,17 @@ int main(int argc, char **argv)
 	setenv("HOME", "/root", 1);
 	setenv("TERM", "dumb", 1);
 	signal(SIGPIPE, SIG_IGN);
-	if (access("/dev/null", F_OK))
-		mknod("/dev/null", S_IFCHR | 0666, makedev(1, 3));
+	/* No devtmpfs: create the usual character devices. */
+	static const struct {
+		const char *path;
+		int major, minor;
+	} devs[] = {
+		{"/dev/null", 1, 3}, {"/dev/zero", 1, 5}, {"/dev/full", 1, 7},
+		{"/dev/random", 1, 8}, {"/dev/urandom", 1, 9}, {"/dev/tty", 5, 0},
+	};
+	for (size_t i = 0; i < sizeof devs / sizeof *devs; i++)
+		if (access(devs[i].path, F_OK))
+			mknod(devs[i].path, S_IFCHR | 0666, makedev(devs[i].major, devs[i].minor));
 	mkdir("/tmp", 01777);
 	mkdir("/work", 0755);
 	mkdir("/root", 0700);

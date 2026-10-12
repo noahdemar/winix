@@ -2,7 +2,7 @@
 # apt for winix: apt/apt-get/apk-style front end to the winix package repository (wasm builds, not Debian packages).
 # Repository: $WINIX_REPO (default winix://pkgs, the pkgs/ directory next to the page) with index.txt lines
 #   name version sha256 size deps(comma-separated or -) description...
-# and archives name_version.tar.gz, unpacked at /. Installed packages: /var/lib/apt/installed/<name> (version, then files).
+# and archives name_version_<first 12 hex of sha256>.tar.gz, unpacked at /. Installed packages: /var/lib/apt/installed/<name> (version, then files).
 
 REPO=${WINIX_REPO:-winix://pkgs}
 LIB=/var/lib/apt
@@ -40,9 +40,10 @@ install_one() {
 		for d in $(echo "$deps" | tr ',' ' '); do install_one "$d" || return $?; done
 	fi
 	sum=$(field "$pkg" 3)
+	file=${pkg}_${ver}_$(echo "$sum" | cut -c 1-12).tar.gz
 	tmp=/tmp/apt.$$.tar.gz
-	echo "Get: $REPO/${pkg}_$ver.tar.gz [$(field "$pkg" 4) B]"
-	curl -sSf -o "$tmp" "$REPO/${pkg}_$ver.tar.gz" || { rm -f "$tmp"; die "Failed to fetch ${pkg}_$ver.tar.gz"; }
+	echo "Get: $REPO/$file [$(field "$pkg" 4) B]"
+	curl -sSf -o "$tmp" "$REPO/$file" || { rm -f "$tmp"; die "Failed to fetch $file"; }
 	[ "$(sha256sum "$tmp" | cut -d ' ' -f 1)" = "$sum" ] || { rm -f "$tmp"; die "Hash sum mismatch for $pkg"; }
 	echo "Unpacking $pkg ($ver) ..."
 	[ -f "$DB/$pkg" ] && remove_files "$pkg"
@@ -57,19 +58,105 @@ remove_files() { tail -n +2 "$DB/$1" | while read -r f; do rm -f "/${f#./}"; don
 install() {
 	[ $# -gt 0 ] || die "No packages given"
 	need_index
-	missing=
-	for p; do [ -n "$(field "$p" 2)" ] || missing="$missing $p"; done
-	if [ -n "$missing" ]; then
-		for p in $missing; do echo "E: Unable to locate package $p" >&2; done
-		echo "Available: $(awk '{ printf "%s ", $1 }' "$INDEX")" >&2
-		exit 100
-	fi
-	for p; do install_one "$p" || exit $?; done
+	native= missing=
+	for p; do if [ -n "$(field "$p" 2)" ]; then native="$native $p"; else missing="$missing $p"; fi; done
+	for p in $native; do install_one "$p" || exit $?; done
+	[ -n "$missing" ] || return 0
+	if [ "${WINIX_APT_FALLBACK:-1}" != 0 ] && x86_install $missing; then return 0; fi
+	for p in $missing; do echo "E: Unable to locate package $p" >&2; done
+	echo "Available: $(awk '{ printf "%s ", $1 }' "$INDEX")" >&2
+	exit 100
+}
+
+# --- Fallback: Alpine x86-64 packages, run under blink (x86-64 user-mode emulation) -------------------------------
+# Unpacked into $X86ROOT; each command gets a wrapper in /usr/bin that runs it with $X86ROOT layered under /: paths
+# resolve in the real root first (so writes land where the program asked), then fall through to the Alpine files.
+ALPINE=${WINIX_ALPINE:-https://dl-cdn.alpinelinux.org/alpine/v3.20}
+X86ROOT=/opt/x86
+X86DB=$LIB/x86
+X86INDEX=$X86DB/APKINDEX
+
+x86_update() {
+	mkdir -p "$X86DB" /tmp/apt.idx
+	: > "$X86INDEX.new"
+	for r in main community; do
+		echo "Get: $ALPINE/$r/x86_64/APKINDEX.tar.gz"
+		curl -sSf -o /tmp/apt.idx/i.tgz "$ALPINE/$r/x86_64/APKINDEX.tar.gz" && tar xzf /tmp/apt.idx/i.tgz -C /tmp/apt.idx APKINDEX ||
+			{ rm -rf /tmp/apt.idx "$X86INDEX.new"; return 1; }
+		awk -v r="$r" '{ print } /^P:/ { print "R:" r }' /tmp/apt.idx/APKINDEX >> "$X86INDEX.new"
+	done
+	rm -rf /tmp/apt.idx
+	mv "$X86INDEX.new" "$X86INDEX"
+}
+
+# Prints "repo name version" for the given packages and their missing dependencies, dependencies first.
+# Dependencies are package names or provided names (so:libfoo.so.1, cmd:foo). Exits 1 if a requested name is unknown.
+x86_resolve() {
+	awk -v want="$*" -v have="$(ls "$X86DB" 2>/dev/null | grep -v '^APKINDEX' | tr '\n' ' ')" '
+	BEGIN { n = split(want, W, " "); for (i = 1; i <= n; i++) Q[++q] = W[i]; m = split(have, H, " "); for (i = 1; i <= m; i++) inst[H[i]] = 1 }
+	/^P:/ { name = substr($0, 3) }
+	/^V:/ { ver[name] = substr($0, 3) }
+	/^R:/ { repo[name] = substr($0, 3) }
+	/^D:/ { deps[name] = substr($0, 3) }
+	/^p:/ { k = split(substr($0, 3), P, " "); for (i = 1; i <= k; i++) { t = P[i]; sub(/=.*/, "", t); if (!(t in prov)) prov[t] = name } }
+	END {
+		for (h = 1; h <= q; h++) {
+			t = Q[h]; sub(/[<>=~].*/, "", t)
+			if (t ~ /^!/ || t == "") continue
+			p = (t in ver) ? t : ((t in prov) ? prov[t] : "")
+			if (p == "") { if (h <= n) { print "MISSING " t; bad = 1 }; continue }
+			if (p in seen) continue
+			seen[p] = 1
+			if (!(p in inst)) order[++o] = p
+			k = split(deps[p], D, " "); for (i = 1; i <= k; i++) Q[++q] = D[i]
+		}
+		if (bad) exit 1
+		for (i = o; i >= 1; i--) { p = order[i]; print repo[p], p, ver[p] }
+	}' "$X86INDEX"
+}
+
+x86_install() {
+	[ -s "$X86INDEX" ] || x86_update || return 1
+	plan=$(x86_resolve "$@") || return 1
+	echo "N: Not built for winix; installing the Alpine x86-64 build (runs under blink emulation, slower)"
+	command -v blink >/dev/null || install_one blink || return 1
+	mkdir -p "$X86ROOT"
+	echo "$plan" | while read -r repo name ver; do
+		[ -n "$name" ] || continue
+		apk=/tmp/apt.$$.apk
+		echo "Get: $ALPINE/$repo/x86_64/$name-$ver.apk"
+		curl -sSf -o "$apk" "$ALPINE/$repo/x86_64/$name-$ver.apk" || { rm -f "$apk"; die "Failed to fetch $name-$ver.apk"; }
+		echo "Unpacking $name ($ver) [x86-64] ..."
+		tar xzf "$apk" -C "$X86ROOT" 2>/dev/null
+		rm -f "$X86ROOT"/.PKGINFO "$X86ROOT"/.SIGN.* "$X86ROOT"/.pre-* "$X86ROOT"/.post-* "$X86ROOT"/.trigger
+		{
+			echo "$ver"
+			tar tzf "$apk" 2>/dev/null | grep -v '^\.\|/$' | sed "s#^#$X86ROOT/#"
+			# Wrappers for commands that do not clash with native ones.
+			tar tzf "$apk" 2>/dev/null | grep -E '^(usr/)?s?bin/[^/]+$' | while read -r f; do
+				c=${f##*/}
+				[ -e "/usr/bin/$c" ] || [ -e "/bin/$c" ] || [ -e "/sbin/$c" ] || [ -e "/usr/sbin/$c" ] && continue
+				# Run the real file by its full path: /usr/bin/$c in the real root is this wrapper.
+				printf '#!/bin/sh\n# %s from Alpine %s (x86-64, via blink)\nexport BLINK_OVERLAYS=:%s\nexec blink %s/%s "$@"\n' \
+					"$c" "$name" "$X86ROOT" "$X86ROOT" "$f" > "/usr/bin/$c"
+				chmod 755 "/usr/bin/$c"
+				echo "/usr/bin/$c"
+			done
+		} > "$X86DB/$name"
+		rm -f "$apk"
+		echo "Setting up $name ($ver) [x86-64] ..."
+	done
 }
 
 remove() {
 	[ $# -gt 0 ] || die "No packages given"
 	for p; do
+		if [ -f "$X86DB/$p" ] && [ "$p" != APKINDEX ]; then
+			echo "Removing $p ($(head -n 1 "$X86DB/$p")) [x86-64] ..."
+			tail -n +2 "$X86DB/$p" | while read -r f; do rm -f "$f"; done
+			rm -f "$X86DB/$p"
+			continue
+		fi
 		[ -f "$DB/$p" ] || { echo "Package '$p' is not installed, so not removed"; continue; }
 		echo "Removing $p ($(installed_version "$p")) ..."
 		remove_files "$p"
@@ -84,6 +171,11 @@ list() {
 		mark=; [ -f "$DB/$name" ] && mark=" [installed]"
 		echo "$name/winix $ver wasm32$mark"
 	done < "$INDEX"
+	if [ "$1" = --installed ] && [ -d "$X86DB" ]; then
+		for f in "$X86DB"/*; do
+			[ -f "$f" ] && [ "${f##*/}" != APKINDEX ] && echo "${f##*/}/alpine $(head -n 1 "$f") x86_64 [installed]"
+		done
+	fi
 }
 
 search() {
