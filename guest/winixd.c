@@ -217,6 +217,8 @@ static void do_read(uint32_t tag, struct rd *r)
 	free(path);
 }
 
+#include "session-fs.h"
+
 int main(int argc, char **argv)
 {
 	setenv("PATH", "/sbin:/usr/sbin:/bin:/usr/bin", 1);
@@ -262,6 +264,24 @@ int main(int argc, char **argv)
 			break;
 		case OP_READ:
 			do_read(tag, &r);
+			break;
+		case OP_FS_LIST:
+			do_fs_list(tag);
+			break;
+		case OP_FS_READ:
+			do_fs_read(tag, &r);
+			break;
+		case OP_FS_WRITE:
+			do_fs_write(tag, &r);
+			break;
+		case OP_FS_NODE:
+			do_fs_node(tag, &r);
+			break;
+		case OP_FS_META:
+			do_fs_meta(tag, &r);
+			break;
+		case OP_FS_REMOVE:
+			do_fs_remove(tag, &r);
 			break;
 		default:
 			reply_err(tag, ENOSYS, "unknown op");

@@ -31,6 +31,15 @@ enum {
 	RP_RESP = 0x90,  /* u32 status, str status_text, str headers ("k: v\n"...) */
 	RP_BODY = 0x91,  /* bytes... */
 	RP_END = 0x92,   /* (empty) */
+	/* session filesystem (guest/session-fs.h): see src/session.js */
+	OP_FS_LIST = 0x20,   /* (empty) -> RP_FS_ENTRY... then RP_OK */
+	OP_FS_READ = 0x21,   /* str path, u32 offset, u32 length -> RP_DATA */
+	OP_FS_WRITE = 0x22,  /* str path, u32 offset, u8 truncate, blob data -> RP_OK */
+	OP_FS_NODE = 0x23,   /* u8 kind (d/l/h), str path, str target -> RP_OK */
+	OP_FS_META = 0x24,   /* str path, u32 mode, uid, gid, str mtime_sec, u32 mtime_nsec, u8 is_link -> RP_OK */
+	OP_FS_REMOVE = 0x25, /* str path -> RP_OK */
+	RP_FS_ENTRY = 0x87,  /* str path, u8 type, u32 mode, uid, gid, size_lo, size_hi, str mtime_sec, u32 mtime_nsec,
+	                        str inode, str target */
 };
 
 struct buf {

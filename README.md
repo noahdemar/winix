@@ -121,6 +121,29 @@ node scripts/serve.mjs dist 8000
 
 The server listens on localhost only, because `/__proxy` will fetch any URL.
 
+## Save and load a session
+
+**Save Session** downloads a `.winix` file: a snapshot of the guest's filesystem (files, empty directories, modes,
+owners, modification times, symlinks, and hard links), plus host state you supply. **Load Session** boots a new
+machine from the file and swaps it in only if the restore succeeds.
+
+- What is kept: the whole root filesystem except `/proc`, `/sys`, `/dev`, `/tmp` and `/run`, and except mounted and
+  special files. Running programs, shell variables, terminal state and editor buffers are not kept. A session
+  replaces the page's history with the one saved in the host state, not with a replay of commands.
+- Writes are not frozen while saving. The save checks the filesystem before and after reading it, and fails if
+  anything changed, so stop background programs and editors first.
+- Trust: each chunk is checksummed, which detects corruption but does not prove who made the file. Sessions can
+  contain secrets such as `.env` files and keys. They are not encrypted.
+- Compatibility: a session restores only into the same winix build (the same kernel and initramfs bytes) and variant.
+- The format is in `src/session.js`; the guest side is `guest/session-fs.h`. Archives are validated before any machine
+  starts. Limits: 512 MiB of files, 100000 entries, 32 MiB of manifest.
+
+API: `await w.exportSession({ hostState, onProgress })` returns a Blob; `await Winix.restoreSession(file, options)`
+returns a new instance (the caller's instance is not changed); `w.hostState` is a copy of the saved host state;
+`w.keyInput(text)` types into the console.
+
+Focused check: `node tests/session.mjs` (page `src/session-test.html`, served from `dist/`).
+
 ## Tests
 
 Both need a Chromium-based browser and `playwright-core` (set `PLAYWRIGHT_CORE` to its path and, for Edge,

@@ -50,6 +50,14 @@
     <span>$</span>
     <input id="cmd" placeholder="type a command" disabled spellcheck="false" autocapitalize="off" aria-label="command">
   </form>
+  <nav id="session">
+    <button id="save" type="button" disabled>Save Session</button>
+    <button id="load" type="button" disabled>Load Session</button>
+    <input id="loadfile" type="file" accept=".winix" hidden>
+  </nav>
+  <p class="meta">Sessions save files only (not running programs or editor buffers, and not the terminal). Stop background
+    writers and save editors first. Backups can contain secrets such as .env files and keys.</p>
+  <div id="session-status" class="meta" role="status"></div>
   <footer>Each command runs in a fresh <code>sh</code>; files persist. Full-screen programs (vi, top) need the <a href="terminal.html">terminal</a>.</footer>
 </main>
 <script type="module">
@@ -69,33 +77,45 @@ let hpos = 0;
 const el = (tag, cls, text) => Object.assign(document.createElement(tag), { className: cls, textContent: text });
 
 const t0 = performance.now();
-const w = await Winix.boot({ fetch: proxyFetch() }).catch((e) => {
+let w = await Winix.boot({ fetch: proxyFetch() }).catch((e) => {
   $('status').textContent = 'boot failed: ' + e.message;
   throw e;
 });
 $('status').innerHTML = `<b>ready</b> · booted in ${Math.round(performance.now() - t0)} ms`;
-$('cmd').disabled = false;
-$('cmd').focus();
+let busy = false;
+// One busy state for command runs, saves and loads: while busy, nothing else can be typed or started.
+const setBusy = (on) => {
+  busy = on;
+  for (const b of document.querySelectorAll('button')) b.disabled = on;
+  $('cmd').disabled = on;
+  if (!on) $('cmd').focus();
+};
+setBusy(false);
+$('save').disabled = $('load').disabled = false;
 
 // Offer the essential add-ons once per browser. A "Not now" is remembered in localStorage; if storage is blocked, the offer just shows again.
 const essentials = ['jq', 'zlib'];
 async function offerEssentials() {
+  const me = w; // an offer that finishes after the session was swapped is for the old machine: ignored
   let declined = false;
   try { declined = localStorage.getItem('winix.essentialsDeclined') === '1'; } catch {}
   if (declined) return;
-  const have = await w.exec('test -x /usr/bin/jq && echo yes', { timeoutMs: 10000 }).catch(() => null);
-  if (have?.stdout.includes('yes')) return;
+  const have = await me.exec('test -x /usr/bin/jq && echo yes', { timeoutMs: 10000 }).catch(() => null);
+  if (have?.stdout.includes('yes') || w !== me || busy) return;
   const box = el('div', 'entry');
   box.append(el('div', '', `Set up essential add-ons (${essentials.join(', ')})?`));
   const bar = el('nav');
   const install = el('button', '', 'Install');
   const skip = el('button', '', 'Not now');
   install.type = skip.type = 'button';
+  install.disabled = skip.disabled = busy;
   install.onclick = () => {
+    if (busy || w !== me) return;
     box.remove();
     run(`apt-get install -y ${essentials.join(' ')}`);
   };
   skip.onclick = () => {
+    if (busy) return;
     try { localStorage.setItem('winix.essentialsDeclined', '1'); } catch {}
     box.remove();
   };
@@ -106,13 +126,13 @@ async function offerEssentials() {
 offerEssentials();
 
 async function run(cmd) {
-  if (!cmd.trim()) return;
+  if (!cmd.trim() || busy) return;
   history.push(cmd);
   hpos = history.length;
   const entry = el('div', 'entry');
   entry.append(el('div', 'cmd', cmd));
   $('log').append(entry);
-  $('cmd').disabled = true;
+  setBusy(true);
   try {
     const r = await w.exec(cmd, { timeoutMs: 30000 });
     if (r.stdout) entry.append(el('pre', 'stdout', r.stdout.replace(/\n$/, '')));
@@ -124,10 +144,68 @@ async function run(cmd) {
   } catch (e) {
     entry.append(el('pre', 'stderr', e.message));
   }
-  $('cmd').disabled = false;
-  $('cmd').focus();
+  setBusy(false);
   entry.scrollIntoView({ block: 'nearest' });
 }
+
+// Session save/load: the archive is a filesystem snapshot (not running programs or editor buffers).
+const stamp = () => new Date().toISOString().replace(/[:.]/g, '-');
+const note = (text) => { $('session-status').textContent = text; };
+$('save').onclick = async () => {
+  if (busy) return;
+  setBusy(true);
+  note('saving…');
+  try {
+    const blob = await w.exportSession({
+      hostState: { ui: { history: history.slice(), output: $('log').textContent } },
+      onProgress: (p) => note(`saving… ${p.filesDone}/${p.filesTotal} files`),
+    });
+    const url = URL.createObjectURL(blob);
+    const a = Object.assign(document.createElement('a'), { href: url, download: `winix-session-${stamp()}.winix` });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    note(`saved ${Math.round(blob.size / 1024)} KiB`);
+  } catch (e) {
+    note('save failed: ' + e.message);
+  }
+  setBusy(false);
+};
+$('load').onclick = () => { if (!busy) $('loadfile').click(); };
+$('loadfile').onchange = async () => {
+  const file = $('loadfile').files[0];
+  $('loadfile').value = '';
+  if (!file || busy) return;
+  const ok = confirm('Load this session? It replaces this page\'s filesystem and history, and any unsaved work ' +
+    'in the current session is lost. Load only backups you trust: they can contain files such as .env or keys.');
+  if (!ok) return;
+  setBusy(true);
+  note('loading…');
+  let next;
+  try {
+    next = await Winix.restoreSession(file, {
+      fetch: proxyFetch(),
+      onProgress: (p) => note(`${p.phase} ${p.filesDone}/${p.filesTotal} files`),
+    });
+  } catch (e) {
+    note('load failed, current session kept: ' + e.message);
+    setBusy(false);
+    return;
+  }
+  const old = w;
+  w = next;
+  old.dispose();
+  const ui = w.hostState?.ui ?? {};
+  history.length = 0;
+  for (const h of Array.isArray(ui.history) ? ui.history : []) if (typeof h === 'string') history.push(h);
+  hpos = history.length;
+  $('log').replaceChildren();
+  if (typeof ui.output === 'string' && ui.output) $('log').append(el('pre', 'saved', ui.output));
+  $('log').append(el('div', 'meta', `session restored from ${file.name}`));
+  note('session restored');
+  setBusy(false);
+};
 
 for (const ex of examples) {
   const b = el('button', '', ex.length > 34 ? ex.slice(0, 32) + '…' : ex);
