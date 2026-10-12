@@ -1,6 +1,7 @@
 /* curl: HTTP(S) through the host page's fetch() over a /dev/winix channel (the guest has no sockets).
- * Supports the common flags: -s -S -f -L -i -I -o FILE -O -X METHOD -H HEADER -d/--data/--data-raw/--data-binary
- * (@file reads a file, @- stdin) -A UA -w '%{http_code}' --fail-with-body. Redirects are always followed. */
+ * Supports the common flags: -s -S -f -L -i -I -N -o FILE -O -X METHOD -H HEADER -d/--data/--data-raw/--data-binary
+ * (@file reads a file, @- stdin) -A UA -w '%{http_code}' --fail-with-body. Redirects are always followed.
+ * Response bodies stream: each chunk the host reads is written out as it arrives (SSE, LLM token streams). */
 #define _GNU_SOURCE
 #include "winix-proto.h"
 
@@ -64,6 +65,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--include")) include = 1;
 		else if (!strcmp(a, "--head")) head = 1;
 		else if (!strcmp(a, "--remote-name")) remote_name = 1;
+		else if (!strcmp(a, "--no-buffer")) ; /* body chunks are written as they arrive; nothing to turn off */
 		else if (a[0] == '-' && a[1] && a[1] != '-') {
 			for (const char *c = a + 1; *c; c++) {
 				switch (*c) {
@@ -75,6 +77,7 @@ int main(int argc, char **argv)
 				case 'I': head = 1; break;
 				case 'O': remote_name = 1; break;
 				case 'k': break;
+				case 'N': break; /* see --no-buffer */
 				default: usage();
 				}
 			}

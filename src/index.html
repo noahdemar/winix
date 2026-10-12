@@ -77,6 +77,34 @@ $('status').innerHTML = `<b>ready</b> · booted in ${Math.round(performance.now(
 $('cmd').disabled = false;
 $('cmd').focus();
 
+// Offer the essential add-ons once per browser. A "Not now" is remembered in localStorage; if storage is blocked, the offer just shows again.
+const essentials = ['jq', 'zlib'];
+async function offerEssentials() {
+  let declined = false;
+  try { declined = localStorage.getItem('winix.essentialsDeclined') === '1'; } catch {}
+  if (declined) return;
+  const have = await w.exec('test -x /usr/bin/jq && echo yes', { timeoutMs: 10000 }).catch(() => null);
+  if (have?.stdout.includes('yes')) return;
+  const box = el('div', 'entry');
+  box.append(el('div', '', `Set up essential add-ons (${essentials.join(', ')})?`));
+  const bar = el('nav');
+  const install = el('button', '', 'Install');
+  const skip = el('button', '', 'Not now');
+  install.type = skip.type = 'button';
+  install.onclick = () => {
+    box.remove();
+    run(`apt-get install -y ${essentials.join(' ')}`);
+  };
+  skip.onclick = () => {
+    try { localStorage.setItem('winix.essentialsDeclined', '1'); } catch {}
+    box.remove();
+  };
+  bar.append(install, skip);
+  box.append(bar);
+  $('log').before(box);
+}
+offerEssentials();
+
 async function run(cmd) {
   if (!cmd.trim()) return;
   history.push(cmd);
