@@ -19,6 +19,12 @@
   main { max-width: 760px; margin: 0 auto; padding: 56px 16px 40px; min-height: 100vh; display: flex; flex-direction: column; }
   h1 { font: 600 20px/1 var(--mono); letter-spacing: -0.02em; margin: 0; }
   header p { margin: 10px 0 0; color: var(--muted); }
+  header details { margin-top: 14px; color: var(--muted); }
+  header summary { cursor: pointer; font: 13px var(--mono); color: var(--muted); }
+  header summary:hover { color: var(--fg); }
+  header details ul { margin: 10px 0 0; padding-left: 18px; }
+  header details li { margin: 6px 0; }
+  header b { color: var(--fg); font-weight: 600; }
   #status { font: 13px var(--mono); color: var(--muted); margin-top: 28px; }
   #status b { color: var(--accent); font-weight: 500; }
   #log { flex: 1; margin-top: 12px; font: 13.5px/1.6 var(--mono); }
@@ -41,7 +47,20 @@
 <main>
   <header>
     <h1>winix</h1>
-    <p>A real Linux kernel running in your browser as WebAssembly. No VM, no server. BusyBox, QuickJS and curl included.</p>
+    <p>A Linux kernel running in the browser as WebAssembly, with an API for running shell commands and managing files.</p>
+    <details>
+      <summary>About this sandbox</summary>
+      <ul>
+        <li><b>No CPU emulation.</b> The kernel and tools are compiled to wasm32. Other packages run under Blink
+          (slower).</li>
+        <li><b>Programmatic API.</b> Your app can run commands, read files, and write files in the sandbox. Use it to
+          let an AI agent run tools, test code, or run scripts without touching your own machine.</li>
+        <li><b>Network access is controlled.</b> Programs in the sandbox cannot connect to the internet on their own.
+          Requests only go out when you allow them, and you can log or block them.</li>
+        <li><b>Saved sessions.</b> A machine can be saved to a <code>.winix</code> file and loaded later. The archive is
+          validated before a machine boots.</li>
+      </ul>
+    </details>
   </header>
   <nav id="examples"></nav>
   <div id="status">booting…</div>
@@ -94,16 +113,19 @@ setBusy(false);
 $('save').disabled = $('load').disabled = false;
 
 // Offer the essential add-ons once per browser. A "Not now" is remembered in localStorage; if storage is blocked, the offer just shows again.
-const essentials = ['jq', 'zlib'];
+// Each add-on and a file that proves it is installed. A new add-on here means the offer shows again for everyone.
+const essentials = { python: '/usr/bin/python3', jq: '/usr/bin/jq', zlib: '/usr/include/zlib.h' };
 async function offerEssentials() {
   const me = w; // an offer that finishes after the session was swapped is for the old machine: ignored
   let declined = false;
-  try { declined = localStorage.getItem('winix.essentialsDeclined') === '1'; } catch {}
+  try { declined = localStorage.getItem('winix.essentialsDeclined.v2') === '1'; } catch {}
   if (declined) return;
-  const have = await me.exec('test -x /usr/bin/jq && echo yes', { timeoutMs: 10000 }).catch(() => null);
+  const check = Object.values(essentials).map((f) => `test -e ${f}`).join(' && ') + ' && echo yes';
+  const have = await me.exec(check, { timeoutMs: 10000 }).catch(() => null);
   if (have?.stdout.includes('yes') || w !== me || busy) return;
   const box = el('div', 'entry');
-  box.append(el('div', '', `Set up essential add-ons (${essentials.join(', ')})?`));
+  const names = Object.keys(essentials);
+  box.append(el('div', '', `Set up essential add-ons (${names.join(', ')})?`));
   const bar = el('nav');
   const install = el('button', '', 'Install');
   const skip = el('button', '', 'Not now');
@@ -112,11 +134,11 @@ async function offerEssentials() {
   install.onclick = () => {
     if (busy || w !== me) return;
     box.remove();
-    run(`apt-get install -y ${essentials.join(' ')}`);
+    run(`apt-get install -y ${names.join(' ')}`);
   };
   skip.onclick = () => {
     if (busy) return;
-    try { localStorage.setItem('winix.essentialsDeclined', '1'); } catch {}
+    try { localStorage.setItem('winix.essentialsDeclined.v2', '1'); } catch {}
     box.remove();
   };
   bar.append(install, skip);

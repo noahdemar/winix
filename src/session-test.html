@@ -85,7 +85,8 @@ await step('boot and build the fixture filesystem', async () => {
 });
 await step('install sqlite from the local repository and create a database', async () => {
   const inst = await w.exec('apt-get install -y sqlite', { timeoutMs: 300000 });
-  check(inst.exitCode === 0, 'apt install failed: ' + inst.stderr.slice(-200));
+  check(inst.exitCode === 0 && !inst.timedOut,
+    `apt install failed: exit ${inst.exitCode}, timedOut ${inst.timedOut}, out ${JSON.stringify(inst.stdout.slice(-300))}, err ${JSON.stringify(inst.stderr.slice(-200))}`);
   const db = await w.exec('sqlite3 /work/db.sqlite "create table t(v); insert into t values (1),(2),(3);" && sqlite3 /work/db.sqlite "select sum(v) from t"');
   eq(db.stdout, '6\n', 'sum before save');
   return 'installed';
