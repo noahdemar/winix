@@ -1,26 +1,45 @@
 # CPython 3.12 (python3) cross-built for winix's wasm32 musl guest. Sourced by scripts/build-packages.sh.
-# EXPERIMENTAL: built only when named. Needs WINIX_HOST_PYTHON: a native python3.12 on the build host (the cross
-# configure requires the same version as the source; the system python3 on Ubuntu 22.04 is 3.10).
-EXPERIMENTAL=1
+# The cross build needs a native CPython 3.12 on the build host, which must match the source version. If
+# WINIX_HOST_PYTHON is unset, the recipe builds one from the same source with the host compiler.
 NAME=python
 VERSION=3.12.8
 DEPS=-
-DESC="Python 3.12 interpreter and standard library (no threads, no dynamic extension modules)"
+DESC="Python 3.12 interpreter and standard library (sqlite3; no threads, no dynamic extension modules)"
 URL=https://www.python.org/ftp/python/$VERSION/Python-$VERSION.tgz
 SHA256=5978435c479a376648cb02854df3b892ace9ed7d32b1fead652712bee9d03a45
 ZLIB_URL=https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
 ZLIB_SHA256=9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23
+SQLITE_URL=https://www.sqlite.org/2024/sqlite-amalgamation-3470200.zip
+SQLITE_SHA256=aa73d8748095808471deaa8e6f34aa700e37f2f787f4425744f53fdd15a89c40
 
 build() {
-	: "${WINIX_HOST_PYTHON:?set WINIX_HOST_PYTHON to a python3.12 binary on the build host}"
 	fetch "$URL" "$SHA256" src.tgz
 	tar xzf src.tgz --strip-components=1
+
+	# Host CPython for the cross build. Built in a clean environment so the guest cc wrapper and CC do not leak in.
+	if [ -n "${WINIX_HOST_PYTHON:-}" ]; then
+		HOSTPY="$WINIX_HOST_PYTHON"
+	else
+		rm -rf "$PWD/hostsrc" && mkdir "$PWD/hostsrc" && tar xzf src.tgz -C "$PWD/hostsrc" --strip-components=1
+		(cd "$PWD/hostsrc" && env -i PATH=/usr/bin:/bin HOME="$HOME" ./configure --without-ensurepip >configure.log 2>&1 \
+			&& env -i PATH=/usr/bin:/bin HOME="$HOME" make -j"$(nproc)" python >make.log 2>&1) \
+			|| { tail -20 "$PWD/hostsrc/configure.log" "$PWD/hostsrc/make.log"; return 1; }
+		HOSTPY="$PWD/hostsrc/python"
+	fi
 
 	# zlib, built here as a static library: CPython's zlib module links it.
 	fetch "$ZLIB_URL" "$ZLIB_SHA256" zlib.tgz
 	mkdir zlibsrc && tar xzf zlib.tgz -C zlibsrc --strip-components=1
 	(cd zlibsrc && CC="$WASM_CC" AR="$WORK/bin/ar" RANLIB="$WORK/bin/ranlib" ./configure --static --prefix=/usr >/dev/null && make -j"$(nproc)" libz.a >/dev/null)
 	ZLIB="$PWD/zlibsrc"
+
+	# sqlite3 module: the same amalgamation and flags as packages/sqlite.sh, as a static library.
+	fetch "$SQLITE_URL" "$SQLITE_SHA256" sqlite.zip
+	python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(".")' sqlite.zip || return 1
+	SQLITE="$PWD/$(ls -d sqlite-amalgamation-*)" || return 1
+	"$WASM_CC" -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_DQS=0 \
+		-DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_MATH_FUNCTIONS -c "$SQLITE/sqlite3.c" -o "$SQLITE/sqlite3.o" || return 1
+	"$WORK/bin/ar" rcs "$SQLITE/libsqlite3.a" "$SQLITE/sqlite3.o" || return 1
 
 	# The guest toolchain cannot run test programs, so facts configure would probe are given here. Any function
 	# musl lacks that configure still finds (the guest link is -shared, which accepts undefined symbols) must be listed.
@@ -30,18 +49,27 @@ build() {
 		ac_cv_func_chflags=no ac_cv_func_lchflags=no ac_cv_func_rtpSpawn=no \
 		ac_cv_func_fork1=no ac_cv_func_plock=no ac_cv_func_getwd=no ac_cv_func__getpty=no ac_cv_func_pthread_init=no \
 		ac_cv_func_explicit_memset=no ac_cv_func_uuid_generate_time_safe=no
-	CC="$WASM_CC" CPPFLAGS="-I$ZLIB" LDFLAGS="-L$ZLIB" ./configure \
-		--host=wasm32-linux-musl --build=x86_64-pc-linux-gnu --with-build-python="$WINIX_HOST_PYTHON" \
+	CC="$WASM_CC" CPPFLAGS="-I$ZLIB -I$SQLITE" LDFLAGS="-L$ZLIB -L$SQLITE" ./configure \
+		--host=wasm32-linux-musl --build=x86_64-pc-linux-gnu --with-build-python="$HOSTPY" \
 		--prefix=/usr --disable-shared --without-pymalloc --without-ensurepip --disable-ipv6 \
 		--without-doc-strings --without-threads >configure.log 2>&1 || { tail -40 configure.log; return 1; }
 
-	# Modules whose headers or libraries winix does not package yet. _ctypes needs libffi; _uuid needs libuuid.
-	printf '%s\n' '*disabled*' '_lzma' 'readline' 'nis' '_ctypes' '_uuid' > Modules/Setup.local
+	# Modules are listed explicitly: sqlite3 is built statically from the amalgamation; the others need libraries
+	# winix does not package yet (_lzma: xz, readline, nis: rpcsvc headers, _ctypes: libffi, _uuid: libuuid).
+	printf '%s\n' \
+		'*static*' \
+		"_sqlite3 _sqlite/blob.c _sqlite/connection.c _sqlite/cursor.c _sqlite/microprotocols.c _sqlite/module.c _sqlite/prepare_protocol.c _sqlite/row.c _sqlite/statement.c _sqlite/util.c -DSQLITE_OMIT_LOAD_EXTENSION -I$SQLITE -L$SQLITE -lsqlite3" \
+		'*disabled*' '_lzma' 'readline' 'nis' '_ctypes' '_uuid' > Modules/Setup.local
 
-	make -j"$(nproc)" python
+	# -Bsymbolic binds references to symbols defined in this module directly. Without it, CPython's cross-object
+	# references become 373 GOT.* imports, which winix's runtime does not supply, so the module fails to instantiate
+	# (reported as "Illegal instruction"). Lua has none. The link stays the shared-object form the loader expects.
+	rm -f python
+	make -j"$(nproc)" LDFLAGS="-L$ZLIB -L$SQLITE -Wl,-Bsymbolic" python || return 1
+	[ -x python ] || return 1
 
-	mkdir -p "$DEST/usr/bin" "$DEST/usr/lib/python3.12"
-	cp python "$DEST/usr/bin/python3"
+	mkdir -p "$DEST/usr/bin" "$DEST/usr/lib/python3.12/lib-dynload" # no extension modules: lib-dynload stays empty
+	cp python "$DEST/usr/bin/python3" || return 1
 	"$WORK/bin/strip" "$DEST/usr/bin/python3" 2>/dev/null || true
 	# The standard library without test suites, tkinter, IDLE and the bundled pip wheel (ensurepip is disabled).
 	cp -r Lib/. "$DEST/usr/lib/python3.12/"
