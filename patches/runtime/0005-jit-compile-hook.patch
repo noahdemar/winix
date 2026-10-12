@@ -1,19 +1,152 @@
 diff --git a/runtime/linux-worker.js b/runtime/linux-worker.js
-index bcd5617..5cbfac6 100644
+index bcd5617..fff8826 100644
 --- a/runtime/linux-worker.js
 +++ b/runtime/linux-worker.js
-@@ -453,6 +453,23 @@
+@@ -25,6 +25,9 @@
+ 
+   /// The user executable (if any) to run when we're not in vmlinux.
+   let user_executable = null;
++  /// The user executable's bytes, kept for the JIT (winix_jit_fntype parses them), and the parsed signatures.
++  let user_executable_bytes = null;
++  let user_executable_signatures = null;
+   let user_executable_params = null;
+ 
+   /// The user executabe instance, or null. Try using the instance variable in the promise over this one if possible.
+@@ -160,7 +163,9 @@
+ 
+     /// Replace the currently executing image (kthread spawning init, or user process) with a new user process image.
+     wasm_load_executable: (bin_start, bin_end, data_start, table_start) => {
+-      user_executable = WebAssembly.compile(new Uint8Array(memory.buffer).slice(bin_start, bin_end));
++      user_executable_bytes = new Uint8Array(memory.buffer).slice(bin_start, bin_end);
++      user_executable_signatures = null;
++      user_executable = WebAssembly.compile(user_executable_bytes);
+       user_executable_params = {
+         data_start: data_start,
+         table_start: table_start,
+@@ -305,6 +310,107 @@
+     },
+   };
+ 
++  /// For the JIT: maps function table index -> signature of the user executable's functions, encoded as
++  /// bits 0-3 parameter count, 4-5 result count, 8+2k parameter k, 40-41 result (0 i32, 1 i64, 2 f32, 3 f64).
++  const parse_user_signatures = (bytes, table_start) => {
++    let o = 8;
++    const u = () => { let r = 0, sh = 0, b; do { b = bytes[o++]; r += (b & 127) * 2 ** sh; sh += 7; } while (b & 128); return r; };
++    const sleb = () => { let r = 0n, sh = 0n, b; do { b = bytes[o++]; r |= BigInt(b & 127) << sh; sh += 7n; } while (b & 128); if (b & 64) r -= 1n << sh; return Number(BigInt.asIntN(32, r)); };
++    const code = { 0x7f: 0n, 0x7e: 1n, 0x7d: 2n, 0x7c: 3n };
++    const types = [], func_types = [], table = new Map(), bodies = [], globals = {};
++    let imported_funcs = 0, imported_globals = 0;
++    const skip_limits = () => { const flags = u(); u(); if (flags & 1) u(); };
++    while (o < bytes.length) {
++      const id = bytes[o++], size = u(), end = o + size;
++      if (id === 1) {
++        for (let n = u(); n--;) {
++          o++;  // 0x60
++          const params = [], results = [];
++          for (let k = u(); k--;) params.push(bytes[o++]);
++          for (let k = u(); k--;) results.push(bytes[o++]);
++          let sig = BigInt(params.length) | BigInt(results.length) << 4n;
++          let ok = params.length < 16 && results.length < 2;
++          params.forEach((t, k) => { if (!(t in code)) ok = false; else sig |= code[t] << BigInt(8 + 2 * k); });
++          if (results.length) { if (!(results[0] in code)) ok = false; else sig |= code[results[0]] << 40n; }
++          types.push(ok ? sig : -1n);
++        }
++      } else if (id === 2) {
++        for (let n = u(); n--;) {
++          let field = '';
++          for (let k = 0; k < 2; k++) {  // module and field names (u() moves o itself)
++            const n = u();
++            if (k) field = String.fromCharCode(...bytes.subarray(o, o + n));
++            o += n;
++          }
++          const kind = bytes[o++];
++          if (kind === 3) globals[field] = imported_globals++;
++          if (kind === 0) { func_types.push(u()); imported_funcs++; }
++          else if (kind === 1) { o++; skip_limits(); }
++          else if (kind === 2) skip_limits();
++          else if (kind === 3) o += 2;
++          else if (kind === 4) { o++; u(); }
++        }
++      } else if (id === 3) {
++        for (let n = u(); n--;) func_types.push(u());
++      } else if (id === 10) {
++        for (let n = u(), k = 0; k < n; k++) {
++          const size = u();
++          bodies.push([o, o + size]);
++          o += size;
++        }
++      } else if (id === 9) {
++        for (let n = u(); n--;) {
++          const flags = u();
++          let offset = 0;
++          const const_expr = () => {
++            const stack = [];
++            for (;;) {
++              const op = bytes[o++];
++              if (op === 0x0b) break;
++              if (op === 0x41) stack.push(sleb());
++              else if (op === 0x23) { u(); stack.push(table_start); }  // global.get __table_base
++              else if (op === 0x6a) { const b = stack.pop(); stack.push(stack.pop() + b); }
++              else return null;
++            }
++            return stack.pop();
++          };
++          if (flags === 0 || flags === 2) {
++            if (flags === 2) u();
++            offset = const_expr();
++            if (flags === 2) o++;  // elemkind
++            const count = u();
++            for (let k = 0; k < count; k++) {
++              const fn = u();
++              if (offset !== null) table.set(offset + k, fn);
++            }
++          } else {
++            o = end;  // passive/declarative or expression segments: not used for function pointers here
++          }
++        }
++      }
++      o = end;
++    }
++    const signatures = new Map(), body_ranges = new Map();
++    for (const [index, fn] of table) {
++      const t = types[func_types[fn]];
++      if (t !== undefined) signatures.set(index, t);
++      if (fn >= imported_funcs && bodies[fn - imported_funcs]) body_ranges.set(index, bodies[fn - imported_funcs]);
++    }
++    return { signatures, body_ranges, globals };
++  };
++
++  const user_signatures = () => {
++    if (!user_executable_signatures) {
++      try {
++        user_executable_signatures = parse_user_signatures(user_executable_bytes, Number(user_executable_params.table_start));
++      } catch (error) {
++        log("winix_jit: cannot parse the executable: " + error);
++        user_executable_signatures = { signatures: new Map(), body_ranges: new Map(), globals: {} };
++      }
++    }
++    return user_executable_signatures;
++  };
++
+   /// Callbacks from the main thread.
+   const message_callbacks = {
+     init: (message) => {
+@@ -453,6 +559,47 @@
              // Exception tag for programs built with wasm setjmp/longjmp support (thrown and caught within the program).
              __c_longjmp: new WebAssembly.Tag({ parameters: ['i' + arch_bits] }),
  
-+            // JIT support: the program hands over a small wasm module (exporting "f", importing env.memory and
-+            // env.table); it is compiled synchronously, instantiated against this program's memory and function
-+            // table, and appended to the table. Returns the table index, i.e. a C function pointer, or -1.
++            // JIT support (blink's wasm backend). winix_jit_compile: the program hands over a small wasm module
++            // (exporting "f", importing env.memory and env.table); it is compiled synchronously, instantiated
++            // against this program's memory and function table, and appended to the table. Returns the table
++            // index, i.e. a C function pointer, or -1. winix_jit_fntype: the wasm signature of one of the program's
++            // functions, by function pointer (see parse_user_signatures), or -1.
 +            winix_jit_compile: (bytes, length) => {
 +              try {
 +                const table = user_executable_imports.env.__indirect_function_table;
 +                const module = new WebAssembly.Module(new Uint8Array(memory.buffer).slice(bytes, bytes + length));
-+                const instance = new WebAssembly.Instance(module, { env: { memory: memory, table: table } });
++                const instance = new WebAssembly.Instance(module, {
++                  env: { memory: memory, table: table, sp: user_executable_imports.env.__stack_pointer },
++                });
 +                const index = table.grow(1);
 +                table.set(index, instance.exports.f);
 +                return index;
@@ -21,6 +154,26 @@ index bcd5617..5cbfac6 100644
 +                log("winix_jit_compile: " + error);
 +                return -1;
 +              }
++            },
++            winix_jit_fntype: (fn) => {
++              const sig = user_signatures().signatures.get(fn >>> 0);
++              return sig === undefined ? -1n : sig;
++            },
++            // For inlining: copies the wasm body (locals + code) of the function at fn into out; returns its
++            // length, or -1 if it is unknown or does not fit.
++            winix_jit_fnbody: (fn, out, cap) => {
++              const range = user_signatures().body_ranges.get(fn >>> 0);
++              if (!range || range[1] - range[0] > cap) return -1;
++              new Uint8Array(memory.buffer).set(user_executable_bytes.subarray(range[0], range[1]), out);
++              return range[1] - range[0];
++            },
++            // memory base, table base, and the global indices of __stack_pointer, __memory_base, __table_base
++            winix_jit_bases: (out) => {
++              const g = user_signatures().globals;
++              new Uint32Array(memory.buffer, out, 5).set([
++                Number(user_executable_params.data_start), Number(user_executable_params.table_start),
++                g.__stack_pointer ?? -1, g.__memory_base ?? -1, g.__table_base ?? -1,
++              ]);
 +            },
 +
              // To be correct, we should save AND restore these globals between the user instance and vmlinux instance:

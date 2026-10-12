@@ -272,6 +272,18 @@ echo "it's"`;
     const r = await w.exec('blink /work/fork.x86', { timeoutMs: 20000 });
     eq(r.exitCode, 7, 'stderr ' + r.stderr);
   }],
+  ['40 blink wasm JIT matches the interpreter', async () => {
+    // ecx = 100000; eax = 0; do { eax += ecx; ecx--; } while (ecx != 0); exit(eax & 255)
+    // 32-bit sum 1..100000 = 705082704, & 255 = 80. cmp+jne exercises the fused compare-and-branch.
+    const code = [0xb9, 0xa0, 0x86, 0x01, 0x00, 0x31, 0xc0, 0x01, 0xc8, 0xff, 0xc9, 0x83, 0xf9, 0x00, 0x75, 0xf7,
+      0x89, 0xc7, 0x81, 0xe7, 0xff, 0, 0, 0, 0xb8, 60, 0, 0, 0, 0x0f, 0x05];
+    await w.writeFile('/work/sum.x86', x86Elf(code), { mode: 0o755 });
+    const jit = await w.exec('WINIX_JITHOT=1 WINIX_JITSTATS=1 blink /work/sum.x86', { timeoutMs: 20000 });
+    const interp = await w.exec('WINIX_NOJIT=1 blink /work/sum.x86', { timeoutMs: 20000 });
+    eq(interp.exitCode, 80, 'interpreter');
+    eq(jit.exitCode, 80, 'jit, stderr ' + jit.stderr);
+    eq(/paths=[1-9]/.test(jit.stderr), true, 'jit compiled nothing: ' + jit.stderr);
+  }],
 ];
 
 /// A minimal static x86-64 ELF: one R+X segment at 0x400000 holding `code`, entry at its start.

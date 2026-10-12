@@ -10,8 +10,8 @@ build() {
 	fetch "$URL" "$SHA256" src.tar.gz
 	tar xzf src.tar.gz --strip-components=1
 	patch -p1 < "$REPO/packages/blink-wasm.patch"
-	# The guest has no threads, JIT or fixed-address mmap; fork is a snapshot (see blink-wasm.patch).
-	CC=cc ./configure --disable-jit --disable-threads --disable-sockets
+	# The guest has no threads or fixed-address mmap; fork is a snapshot and the JIT emits wasm (see blink-wasm.patch).
+	CC=cc ./configure --disable-threads --disable-sockets
 	# configure probes by running test programs, which cannot run when cross-compiling, so it turns off features
 	# the guest libc and kernel do have. Turn them back on (not threads, sockets, shared or anonymous mappings).
 	# FORK is the snapshot fork from blink-wasm.patch.

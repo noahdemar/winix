@@ -388,302 +388,6 @@ edit(root + '/blink/blink.c', [
      '  GetOpts(argc, argv);\n'),
 ])
 
-WINIX_JIT = r'''
-#ifdef __wasm__
-// Block compiler for wasm hosts (winix). Blink's own JIT emits x86/ARM machine
-// code, which a wasm guest cannot run. Instead, hot straight-line x86 code is
-// compiled into a small wasm function that calls the same per-instruction
-// handlers the interpreter uses, with the decoded operands baked in as
-// constants. That skips, for every instruction, the icache lookup and 15-byte
-// compare, the opcode switch and the interpreter loop. The page installs the
-// function (winix_jit_compile, a runtime import) into this process's function
-// table; the browser compiles it to native code. After each instruction the
-// block exits if ip went anywhere but the next instruction (a branch, a fault
-// handled by longjmp, a rep iteration) or a signal is pending, so the handlers'
-// semantics need no special knowledge here. Opt-in with WINIX_JIT=1: on its
-// own it saves only ~10% (the per-instruction handlers dominate); it is the
-// scaffolding (runtime hook, module emitter, block cache) for a real backend.
-
-#include <time.h>
-
-extern int winix_jit_compile(const void *bytes, unsigned len);
-
-#define WJ_SLOTS 65536
-#define WJ_MAX_INSNS 64
-
-static int g_wj_hot = 64;  // executions before a block is compiled (WINIX_JITHOT)
-static struct {
-  long compiled, failed, runs, insns;
-  double compile_ms;
-} g_wjs;
-
-static double WinixNowMs(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
-}
-
-static void WinixJitStats(void) {
-  char b[256];
-  snprintf(b, sizeof(b),
-           "[winix jit] compiled=%ld failed=%ld block-runs=%ld insns=%ld "
-           "compile=%.0fms\n",
-           g_wjs.compiled, g_wjs.failed, g_wjs.runs, g_wjs.insns, g_wjs.compile_ms);
-  WriteErrorString(b);
-}
-
-struct WinixJitSlot {
-  i64 ip;
-  u32 fn;
-  u16 count;
-  u8 state;  // 0 empty, 1 counting, 2 compiled, 3 not compilable
-};
-
-static struct WinixJitSlot *g_wj;
-static struct System *g_wj_system;
-static int g_wj_off = -1;
-
-struct WinixBuf {
-  u8 *p;
-  size_t n, cap;
-};
-
-static void WbByte(struct WinixBuf *b, u8 x) {
-  if (b->n == b->cap) {
-    b->cap = b->cap ? b->cap * 2 : 1024;
-    unassert((b->p = (u8 *)realloc(b->p, b->cap)));
-  }
-  b->p[b->n++] = x;
-}
-
-static void WbU(struct WinixBuf *b, u64 x) {
-  do {
-    u8 c = x & 127;
-    x >>= 7;
-    WbByte(b, x ? c | 128 : c);
-  } while (x);
-}
-
-static void WbS(struct WinixBuf *b, i64 x) {
-  for (;;) {
-    u8 c = x & 127;
-    x >>= 7;
-    if ((!x && !(c & 64)) || (x == -1 && (c & 64))) {
-      WbByte(b, c);
-      return;
-    }
-    WbByte(b, c | 128);
-  }
-}
-
-static void WbBytes(struct WinixBuf *b, const void *p, size_t n) {
-  for (size_t i = 0; i < n; ++i) WbByte(b, ((const u8 *)p)[i]);
-}
-
-static void WbSection(struct WinixBuf *mod, u8 id, struct WinixBuf *sec) {
-  WbByte(mod, id);
-  WbU(mod, sec->n);
-  WbBytes(mod, sec->p, sec->n);
-  sec->n = 0;
-}
-
-// Memory/table access with memarg (alignment log2, offset); base is local 0 (m).
-static void WbMem(struct WinixBuf *b, u8 op, int align, u32 off) {
-  WbByte(b, op);
-  WbU(b, align);
-  WbU(b, off);
-}
-
-struct WinixInsn {
-  u64 rde, uimm0;
-  i64 disp, next;
-  int len;
-  uintptr_t handler;
-  struct XedDecodedInst *xedd;
-};
-
-static u32 WinixJitEmit(struct Machine *m, struct WinixInsn *in, int n) {
-  int i;
-  u32 fn;
-  struct WinixBuf mod = {0}, sec = {0}, body = {0};
-  const u32 OFF_IP = offsetof(struct Machine, ip);
-  const u32 OFF_OPLEN = offsetof(struct Machine, oplen);
-  const u32 OFF_STASH = offsetof(struct Machine, stashaddr);
-  const u32 OFF_ATTN = offsetof(struct Machine, attention);
-  const u32 OFF_XEDD = offsetof(struct Machine, xedd);
-  static const u8 kHeader[] = {0, 'a', 's', 'm', 1, 0, 0, 0};
-  WbBytes(&mod, kHeader, sizeof(kHeader));
-  // types: 0 = (i32) -> (), 1 = (i32, i64, i64, i64) -> () (opcode handlers)
-  WbU(&sec, 2);
-  WbByte(&sec, 0x60), WbU(&sec, 1), WbByte(&sec, 0x7f), WbU(&sec, 0);
-  WbByte(&sec, 0x60), WbU(&sec, 4), WbByte(&sec, 0x7f), WbByte(&sec, 0x7e),
-      WbByte(&sec, 0x7e), WbByte(&sec, 0x7e), WbU(&sec, 0);
-  WbSection(&mod, 1, &sec);
-  // imports: env.memory (shared, 0..65536 pages), env.table (funcref)
-  WbU(&sec, 2);
-  WbU(&sec, 3), WbBytes(&sec, "env", 3), WbU(&sec, 6), WbBytes(&sec, "memory", 6);
-  WbByte(&sec, 0x02), WbByte(&sec, 0x03), WbU(&sec, 0), WbU(&sec, 65536);
-  WbU(&sec, 3), WbBytes(&sec, "env", 3), WbU(&sec, 5), WbBytes(&sec, "table", 5);
-  WbByte(&sec, 0x01), WbByte(&sec, 0x70), WbByte(&sec, 0x00), WbU(&sec, 0);
-  WbSection(&mod, 2, &sec);
-  WbU(&sec, 1), WbU(&sec, 0);  // one function of type 0
-  WbSection(&mod, 3, &sec);
-  WbU(&sec, 1), WbU(&sec, 1), WbByte(&sec, 'f'), WbByte(&sec, 0x00), WbU(&sec, 0);
-  WbSection(&mod, 7, &sec);
-  // body
-  WbU(&body, 0);                           // no locals
-  WbByte(&body, 0x02), WbByte(&body, 0x40);  // block
-  for (i = 0; i < n; ++i) {
-    // m->xedd = &copy; m->oplen = len; m->ip += len
-    WbByte(&body, 0x20), WbU(&body, 0), WbByte(&body, 0x41), WbS(&body, (i32)(uintptr_t)in[i].xedd);
-    WbMem(&body, 0x36, 2, OFF_XEDD);
-    WbByte(&body, 0x20), WbU(&body, 0), WbByte(&body, 0x41), WbS(&body, in[i].len);
-    WbMem(&body, 0x3a, 0, OFF_OPLEN);
-    WbByte(&body, 0x20), WbU(&body, 0), WbByte(&body, 0x20), WbU(&body, 0);
-    WbMem(&body, 0x29, 3, OFF_IP);
-    WbByte(&body, 0x42), WbS(&body, in[i].len), WbByte(&body, 0x7c);
-    WbMem(&body, 0x37, 3, OFF_IP);
-    // handler(m, rde, disp, uimm0)
-    WbByte(&body, 0x20), WbU(&body, 0);
-    WbByte(&body, 0x42), WbS(&body, (i64)in[i].rde);
-    WbByte(&body, 0x42), WbS(&body, in[i].disp);
-    WbByte(&body, 0x42), WbS(&body, (i64)in[i].uimm0);
-    WbByte(&body, 0x41), WbS(&body, (i32)in[i].handler);
-    WbByte(&body, 0x11), WbU(&body, 1), WbByte(&body, 0x00);
-    // if (m->stashaddr) CommitStash(m)
-    WbByte(&body, 0x20), WbU(&body, 0), WbMem(&body, 0x29, 3, OFF_STASH);
-    WbByte(&body, 0x50), WbByte(&body, 0x45);  // i64.eqz, i32.eqz
-    WbByte(&body, 0x04), WbByte(&body, 0x40);  // if
-    WbByte(&body, 0x20), WbU(&body, 0);
-    WbByte(&body, 0x41), WbS(&body, (i32)(uintptr_t)CommitStash);
-    WbByte(&body, 0x11), WbU(&body, 0), WbByte(&body, 0x00);
-    WbByte(&body, 0x0b);
-    // m->oplen = 0
-    WbByte(&body, 0x20), WbU(&body, 0), WbByte(&body, 0x41), WbS(&body, 0);
-    WbMem(&body, 0x3a, 0, OFF_OPLEN);
-    if (i + 1 < n) {
-      // exit unless execution fell through to the next instruction
-      WbByte(&body, 0x20), WbU(&body, 0), WbMem(&body, 0x29, 3, OFF_IP);
-      WbByte(&body, 0x42), WbS(&body, in[i].next), WbByte(&body, 0x52);
-      WbByte(&body, 0x0d), WbU(&body, 0);
-      WbByte(&body, 0x20), WbU(&body, 0), WbMem(&body, 0x2d, 0, OFF_ATTN);
-      WbByte(&body, 0x0d), WbU(&body, 0);
-    }
-  }
-  WbByte(&body, 0x0b);  // end block
-  WbByte(&body, 0x0b);  // end function
-  WbU(&sec, 1);
-  WbU(&sec, body.n);
-  WbBytes(&sec, body.p, body.n);
-  WbSection(&mod, 10, &sec);
-  fn = winix_jit_compile(mod.p, mod.n);
-  free(mod.p);
-  free(sec.p);
-  free(body.p);
-  return fn == (u32)-1 ? 0 : fn;
-}
-
-static bool WinixIsBlockEnd(u64 rde) {
-  switch (Mopcode(rde)) {
-    case 0x105:  // syscall
-    case 0x0cc: case 0x0cd: case 0x0ce:  // int3, int, into
-    case 0x0f4:  // hlt
-    case 0x0cf:  // iret
-    case 0x0e8: case 0x0e9: case 0x0eb:  // call, jmp
-    case 0x0c2: case 0x0c3:  // ret
-    case 0x0ff:  // group 5: only call/jmp (/2../5) transfer control; inc/dec/push do not
-      return ModrmReg(rde) >= 2 && ModrmReg(rde) <= 5;
-    case 0x10b:  // ud2
-      return true;
-    default:
-      return false;
-  }
-}
-
-static u32 WinixJitCompile(struct Machine *m, i64 ip) {
-  int n = 0;
-  u8 *page;
-  i64 pc = ip;
-  struct XedDecodedInst x;
-  struct WinixInsn in[WJ_MAX_INSNS];
-  if (!(page = LookupAddress2(m, ip & -4096, PAGE_XD, 0))) return 0;
-  while (n < WJ_MAX_INSNS && (pc & 4095) + 15 <= 4096 && (pc & -4096) == (ip & -4096)) {
-    if (DecodeInstruction(&x, page + (pc & 4095), 15, m->mode.omode)) break;
-    in[n].rde = x.op.rde;
-    in[n].disp = x.op.disp;
-    in[n].uimm0 = x.op.uimm0;
-    in[n].len = Oplength(x.op.rde);
-    in[n].handler = (uintptr_t)GetOp(Mopcode(x.op.rde));
-    if (in[n].handler == (uintptr_t)OpUd) break;
-    if (!(in[n].xedd = (struct XedDecodedInst *)malloc(sizeof(x)))) break;
-    memcpy(in[n].xedd, &x, sizeof(x));
-    pc += in[n].len;
-    in[n].next = pc;
-    if (WinixIsBlockEnd(in[n++].rde)) break;
-  }
-  if (!n) return 0;
-  double t0 = WinixNowMs();
-  u32 fn = WinixJitEmit(m, in, n);
-  g_wjs.compile_ms += WinixNowMs() - t0;
-  if (fn) ++g_wjs.compiled, g_wjs.insns += n; else ++g_wjs.failed;
-  return fn;
-}
-
-static struct WinixJitSlot *WinixJitSlot(i64 ip) {
-  unsigned h = (unsigned)((ip ^ (ip >> 13)) * 0x9e3779b1u) & (WJ_SLOTS - 1);
-  for (int i = 0; i < 8; ++i) {
-    struct WinixJitSlot *s = g_wj + ((h + i) & (WJ_SLOTS - 1));
-    if (!s->state || s->ip == ip) return s;
-  }
-  return g_wj + h;  // evict
-}
-
-static bool WinixJitRun(struct Machine *m) {
-  struct WinixJitSlot *s;
-  if (g_wj_off == -1) {
-    g_wj_off = !getenv("WINIX_JIT");  // opt-in until it pays for itself
-    if (getenv("WINIX_JITHOT")) g_wj_hot = atoi(getenv("WINIX_JITHOT"));
-    if (getenv("WINIX_JITSTATS")) atexit(WinixJitStats);
-    if (!g_wj_off && !(g_wj = (struct WinixJitSlot *)calloc(WJ_SLOTS, sizeof(*g_wj)))) g_wj_off = 1;
-  }
-  if (g_wj_off) return false;
-  // Code changed or the process exec'd: everything compiled so far is stale.
-  // (The xedd copies of dropped blocks leak; resets are rare.)
-  if (g_wj_system != m->system ||
-      atomic_load_explicit(&m->opcache->invalidated, memory_order_acquire)) {
-    memset(g_wj, 0, WJ_SLOTS * sizeof(*g_wj));
-    g_wj_system = m->system;
-    return false;
-  }
-  s = WinixJitSlot(m->ip);
-  if (s->state != 0 && s->ip != m->ip) memset(s, 0, sizeof(*s));
-  switch (s->state) {
-    case 2:
-      ++g_wjs.runs;
-      ((void (*)(struct Machine *))(uintptr_t)s->fn)(m);
-      return true;
-    case 3:
-      return false;
-    default:
-      s->ip = m->ip;
-      s->state = 1;
-      if (++s->count == g_wj_hot) {
-        s->fn = WinixJitCompile(m, m->ip);
-        s->state = s->fn ? 2 : 3;
-      }
-      return false;
-  }
-}
-#endif /* __wasm__ */
-
-'''
-
-edit(root + '/blink/machine.c', [
-    ('void ExecuteInstruction(struct Machine *m) {\n', WINIX_JIT + 'void ExecuteInstruction(struct Machine *m) {\n'),
-    ('#else\n  JitlessDispatch(DISPATCH_NOTHING);\n#endif\n}\n',
-     '#else\n#ifdef __wasm__\n  if (WinixJitRun(m)) return;\n#endif\n  JitlessDispatch(DISPATCH_NOTHING);\n#endif\n}\n'),
-])
-
 edit(root + '/blink/machine.h', [
     ('  u64 icache[512][kInstructionBytes / 8];\n',
      '#ifdef __wasm__\n'
@@ -692,6 +396,14 @@ edit(root + '/blink/machine.h', [
      '  u64 icache[65536][kInstructionBytes / 8];\n'
      '#else\n'
      '  u64 icache[512][kInstructionBytes / 8];\n'
+     '#endif\n'),
+    ('  struct MachineTlb tlb[32];             //\n',
+     '#ifdef __wasm__\n'
+     '  // Without linear memory every guest access goes through this TLB; 32\n'
+     '  // entries miss constantly on real programs, each miss a page walk.\n'
+     '  struct MachineTlb tlb[4096];\n'
+     '#else\n'
+     '  struct MachineTlb tlb[32];             //\n'
      '#endif\n'),
 ])
 
@@ -706,4 +418,97 @@ edit(root + '/blink/memorymalloc.c', [
      '    if (tlb) g_machine->invalidated = true;\n'
      '    if (icache) g_machine->opcache->invalidated = true;\n'
      '  }\n#endif\n}\n'),
+])
+
+
+# ---- wasm JIT backend (blink/jitwasm.c, from packages/blink-jitwasm.c) ----
+import os
+here = os.path.dirname(os.path.abspath(__file__))
+
+
+def wrap(p, cond):
+    s = open(p).read()
+    open(p, 'w').write('#if ' + cond + '\n' + s + '\n#endif\n')
+
+
+edit(root + '/blink/builtin.h', [
+    ('#if !defined(DISABLE_JIT) && (defined(__x86_64__) || defined(__aarch64__)) && \\\n',
+     '#if !defined(DISABLE_JIT) &&                                                  \\\n'
+     '    (defined(__x86_64__) || defined(__aarch64__) || defined(__wasm__)) &&    \\\n'),
+    ('#if defined(HAVE_JIT) && defined(__GNUC__) && \\\n',
+     '#if defined(HAVE_JIT) && defined(__GNUC__) && !defined(__wasm__) && \\\n'),
+])
+edit(root + '/blink/jit.h', [
+    ('extern const u8 kJitRes[2];\n',
+     '#ifdef __wasm__\n'
+     '// jitwasm.c: markers path.c emits instead of machine code, and the ender\n'
+     '#define kWasmEnter 0x7761736du\n'
+     '#define kWasmLeave 0x6c656176u\n'
+     '#define kWasmEnder ((uintptr_t)1)\n'
+     'bool AppendJitStashCheck(struct JitBlock *);\n'
+     'uintptr_t WinixJitProbe(i64, bool *);\n'
+     '#endif\n\n'
+     'extern const u8 kJitRes[2];\n'),
+])
+wrap(root + '/blink/jit.c', '!defined(__wasm__)  // see jitwasm.c')
+wrap(root + '/blink/jitflush.c', '!defined(__wasm__)  // see jitwasm.c')
+open(root + '/blink/jitwasm.c', 'w').write(open(os.path.join(here, 'blink-jitwasm.c')).read())
+edit(root + '/blink/path.c', [
+    ('#endif /* __x86_64__ */\n#endif /* HAVE_JIT */\n\nlong GetPrologueSize(void) {\n#ifdef HAVE_JIT\n',
+     '#elif defined(__wasm__)\n'
+     'static const u32 kEnter[] = {kWasmEnter};\n'
+     'static const u32 kLeave[] = {kWasmLeave};\n'
+     '#endif /* __x86_64__ */\n#endif /* HAVE_JIT */\n\nlong GetPrologueSize(void) {\n'
+     '#if defined(HAVE_JIT) && defined(__wasm__)\n'
+     '  return 0;  // paths are functions, entered whole\n'
+     '#elif defined(HAVE_JIT)\n'),
+    ('  struct JitBlock *jb;\n  if (!s->ender) {\n',
+     '  struct JitBlock *jb;\n'
+     '#ifdef __wasm__\n'
+     '  s->ender = kWasmEnder;  // a jump here is a return to the interpreter\n'
+     '  return;\n'
+     '#endif\n'
+     '  if (!s->ender) {\n'),
+    ('#else\n  Jitter(A,\n         "a1i"  // arg1 = pc\n         "q"    // arg0 = machine\n'
+     '         "c",   // call function (EndOp)\n',
+     '#elif !LOG_JIX && defined(__wasm__)\n'
+     '  if (m->reserving) {\n'
+     '    AppendJitStashCheck(m->path.jb);\n'
+     '  }\n'
+     '#else\n  Jitter(A,\n         "a1i"  // arg1 = pc\n         "q"    // arg0 = machine\n'
+     '         "c",   // call function (EndOp)\n'),
+])
+p = root + '/blink/fusion.c'
+s = open(p).read()
+assert s.count('#elif defined(__aarch64__)\n') == 2
+open(p, 'w').write(s.replace('#elif defined(__aarch64__)\n',
+                             '#elif defined(__aarch64__) || defined(__wasm__)  // jitwasm.c decodes these\n'))
+with open(root + '/blink/uop.c', 'a') as f:
+    f.write('''
+#if defined(HAVE_JIT) && defined(__wasm__)
+// In the wasm C ABI these return 128-bit values through a hidden pointer.
+bool WinixJitIsSret(uintptr_t fn) {
+  return fn == (uintptr_t)GetReg128 || fn == (uintptr_t)Load128;
+}
+#endif
+''')
+
+edit(root + '/blink/machine.c', [
+    ('  unassert(m->canhalt);\n  if (CanJit(m)) {\n',
+     '  unassert(m->canhalt);\n  if (CanJit(m)) {\n'
+     '#ifdef __wasm__\n'
+     '    // A path costs a module compile here, so cold code is interpreted with the\n'
+     '    // lean dispatcher and paths are only recorded where execution is hot.\n'
+     '    if (!IsMakingPath(m)) {\n'
+     '      bool hot = false;\n'
+     '      if ((func = (nexgen32e_f)WinixJitProbe(m->ip, &hot))) {\n'
+     '        func(DISPATCH_NOTHING);\n'
+     '      } else if (hot) {\n'
+     '        GeneralDispatch(DISPATCH_NOTHING);\n'
+     '      } else {\n'
+     '        JitlessDispatch(DISPATCH_NOTHING);\n'
+     '      }\n'
+     '      return;\n'
+     '    }\n'
+     '#endif\n'),
 ])

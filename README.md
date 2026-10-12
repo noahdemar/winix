@@ -64,8 +64,18 @@ Packages are built with `setjmp`/`longjmp` lowered to wasm exceptions (`guest/sj
 - ELF segments are copied into anonymous memory instead of `mmap`ped per page; host `mprotect`/partial `munmap`
   (unavailable without an MMU) become no-ops, since guest page permissions live in Blink's own page tables.
 - Upstream bug: without threads, `InvalidateSystem` never flushed the TLB, so `mprotect` never took effect.
-- The instruction cache grows from 512 to 65,536 entries (Python startup ~30% faster); an opt-in block compiler
-  (`WINIX_JIT=1`, via a runtime hook that installs generated wasm functions) is scaffolding for a real JIT backend.
+- **A wasm JIT backend** (`packages/blink-jitwasm.c`, built in as `blink/jitwasm.c`). Blink's JIT records hot x86
+  code as calls to small micro-op functions; on x86/ARM it pastes their machine code together. Here a path becomes a
+  wasm function instead, compiled by the page (`winix_jit_compile`) and called through the program's function table:
+  - micro-ops are **inlined**: the page hands over their wasm bodies from Blink's own binary
+    (`winix_jit_fnbody`), which are re-encoded into the path (locals renumbered, `return` turned into a branch);
+  - other calls are typed `call_indirect`s, with types read from the binary (`winix_jit_fntype`);
+  - paths chain with tail calls, through per-site cache cells, and dispatch in place instead of returning to the
+    interpreter; Blink's few raw ARM branch encodings are decoded into wasm conditionals.
+  Only code that runs 3,000 times gets a path (`WINIX_JITHOT`), so short commands pay nothing. Python: startup
+  unchanged (~1.1 s), CPU-bound loops ~2.4× faster. `WINIX_NOJIT=1` turns it off, `WINIX_JITSTATS=1` prints counts.
+- Bigger caches for a host without linear memory: a 64K-entry instruction cache (Python startup ~30% faster) and a
+  4K-entry TLB.
 - configure cannot run its probes when cross-compiling, so `packages/blink.sh` re-enables the features the guest
   libc and kernel have (`pipe2`, `dup3`, `wait4`, `preadv`, `getrandom`, ...).
 
@@ -97,7 +107,8 @@ node tests/stress.mjs 30 build/stress.json
 ```
 
 `stress.mjs` runs 30 fresh boots of the suite and classifies each as pass / panic / fail / hang.
-`node tests/bench.mjs` prints boot, exec, process-start and file-transfer times.
+`node tests/bench.mjs` prints boot, exec, process-start and file-transfer times. `node tests/profile.mjs CMD` samples
+the guest with the DevTools profiler and prints where the busiest task spent its time.
 
 ## Build
 
