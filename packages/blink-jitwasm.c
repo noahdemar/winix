@@ -80,9 +80,10 @@ static unsigned g_hot = 3000;  // WINIX_JITHOT: below ~1000 startup costs more t
 static bool g_noinline;      // WINIX_JIT_NOINLINE
 static bool g_nomemfast;     // WINIX_JIT_NOMEMFAST
 static bool g_nostackfast;   // WINIX_JIT_NOSTACKFAST
+static int g_batch_max = 16;  // WINIX_JIT_BATCH: paths per module
 static struct {
-  long started, abandoned, paths, failed, ops;
-  double ms;
+  long started, abandoned, paths, failed, ops, bytes, batches;
+  double ms, wasm_ms;
 } g_stats;
 
 static double NowMs(void) {
@@ -92,10 +93,12 @@ static double NowMs(void) {
 }
 
 static void PrintStats(void) {
-  char b[160];
+  char b[192];
   snprintf(b, sizeof(b),
-           "[blink wasm jit] started=%ld abandoned=%ld paths=%ld failed=%ld ops=%ld compile=%.0fms\n",
-           g_stats.started, g_stats.abandoned, g_stats.paths, g_stats.failed, g_stats.ops, g_stats.ms);
+           "[blink wasm jit] started=%ld abandoned=%ld paths=%ld failed=%ld ops=%ld modules=%ld bytes=%ld "
+           "compile=%.0fms (wasm %.0fms)\n",
+           g_stats.started, g_stats.abandoned, g_stats.paths, g_stats.failed, g_stats.ops, g_stats.batches,
+           g_stats.bytes, g_stats.ms, g_stats.wasm_ms);
   write(2, b, strlen(b));
 }
 
@@ -151,6 +154,7 @@ static void SetHook(i64 virt, uintptr_t fn) {
 }
 
 static void ForgetCells(void);
+static void ResetBatch(void);
 
 static void ClearHook(i64 virt) {
   struct Hook *h;
@@ -224,6 +228,7 @@ int InitJit(struct Jit *jit, uintptr_t opt_staging_function) {
   g_owner = jit;
   g_staging = opt_staging_function;
   ForgetCells();
+  ResetBatch();
   free(g_hooks);
   g_hooks = 0;
   g_hooks_cap = g_hooks_used = 0;
@@ -232,6 +237,8 @@ int InitJit(struct Jit *jit, uintptr_t opt_staging_function) {
   g_noinline = !!getenv("WINIX_JIT_NOINLINE");
   g_nomemfast = !!getenv("WINIX_JIT_NOMEMFAST");
   g_nostackfast = !!getenv("WINIX_JIT_NOSTACKFAST");
+  if (getenv("WINIX_JIT_BATCH")) g_batch_max = atoi(getenv("WINIX_JIT_BATCH"));
+  if (g_batch_max < 1 || g_batch_max > 26) g_batch_max = 16;
   static bool stats;
   if (!stats && getenv("WINIX_JITSTATS")) stats = true, atexit(PrintStats);
   return 0;
@@ -240,6 +247,7 @@ int InitJit(struct Jit *jit, uintptr_t opt_staging_function) {
 int DestroyJit(struct Jit *jit) {
   if (jit != g_owner) return 0;
   g_owner = 0;
+  ResetBatch();
   free(g_hooks);
   g_hooks = 0;
   g_hooks_cap = g_hooks_used = 0;
@@ -422,7 +430,7 @@ static void BMem(struct Buf *b, u8 op, int align, u32 off) {
 // value types as reported by winix_jit_fntype: 0 i32, 1 i64, 2 f32, 3 f64
 static const u8 kValType[4] = {0x7f, 0x7e, 0x7d, 0x7c};
 
-#define kMaxTypes 64
+#define kMaxTypes 256
 static long long g_types[kMaxTypes];  // module-local type table (by signature)
 static int g_ntypes;
 
@@ -1111,23 +1119,21 @@ static bool EmitJump(struct Buf *b, const struct Ir *ir, int pathtype, int targe
   }
 }
 
-static uintptr_t Compile(long n) {
+// Code for one path: a function body (locals and code), using the batch's
+// module-wide type table.
+static bool CompileBody(long n, struct Buf *body) {
   long i;
   int pathtype, targettype, stashtype;
-  uintptr_t fn;
-  struct Buf mod = {0}, sec = {0}, body = {0};
-  static const u8 kHeader[] = {0, 'a', 's', 'm', 1, 0, 0, 0};
-  g_ntypes = 0;
   pathtype = TypeIndex(kSigPath);
   targettype = TypeIndex(kSigTarget);
   stashtype = TypeIndex(kSigStash);
   // locals: 32 i64 registers, an i32 scratch, then the inlining pools
-  BU(&body, 5);
-  BU(&body, 32), B1(&body, 0x7e);
-  BU(&body, 1 + kPool), B1(&body, 0x7f);
-  BU(&body, kPool), B1(&body, 0x7e);
-  BU(&body, kPool), B1(&body, 0x7d);
-  BU(&body, kPool), B1(&body, 0x7c);
+  BU(body, 5);
+  BU(body, 32), B1(body, 0x7e);
+  BU(body, 1 + kPool), B1(body, 0x7f);
+  BU(body, kPool), B1(body, 0x7e);
+  BU(body, kPool), B1(body, 0x7d);
+  BU(body, kPool), B1(body, 0x7c);
   i64 arg1 = -1;  // arg1's value while it holds a constant
   for (i = 0; i < n; ++i) {
     struct Ir *ir = g_ir + i;
@@ -1136,53 +1142,89 @@ static uintptr_t Compile(long n) {
     }
     switch (ir->op) {
       case kIrEnter:
-        B1(&body, 0x20), BU(&body, 0), B1(&body, 0xad);  // i64.extend_i32_u
-        SetRegFromStack(&body, kJitSav0);
+        B1(body, 0x20), BU(body, 0), B1(body, 0xad);  // i64.extend_i32_u
+        SetRegFromStack(body, kJitSav0);
         break;
       case kIrSet:
-        B1(&body, 0x42), BS(&body, (i64)ir->x);
-        SetRegFromStack(&body, ir->a);
+        B1(body, 0x42), BS(body, (i64)ir->x);
+        SetRegFromStack(body, ir->a);
         break;
       case kIrMov:
-        GetReg(&body, ir->b);
-        SetRegFromStack(&body, ir->a);
+        GetReg(body, ir->b);
+        SetRegFromStack(body, ir->a);
         break;
       case kIrCall:
-        if (!EmitCallMaybeFast(&body, ir->x, arg1)) goto Fail;
+        if (!EmitCallMaybeFast(body, ir->x, arg1)) return false;
         if (kJitRes0 == kJitArg1 || kJitRes1 == kJitArg1) arg1 = -1;
         break;
       case kIrStash:
-        B1(&body, 0x20), BU(&body, 0);
-        BMem(&body, 0x29, 3, offsetof(struct Machine, stashaddr));
-        B1(&body, 0x50), B1(&body, 0x45);  // != 0
-        B1(&body, 0x04), B1(&body, 0x40);
-        B1(&body, 0x20), BU(&body, 0);
-        B1(&body, 0x41), BS(&body, (i32)(uintptr_t)CommitStash);
-        B1(&body, 0x11), BU(&body, stashtype), B1(&body, 0x00);
-        B1(&body, 0x0b);
+        B1(body, 0x20), BU(body, 0);
+        BMem(body, 0x29, 3, offsetof(struct Machine, stashaddr));
+        B1(body, 0x50), B1(body, 0x45);  // != 0
+        B1(body, 0x04), B1(body, 0x40);
+        B1(body, 0x20), BU(body, 0);
+        B1(body, 0x41), BS(body, (i32)(uintptr_t)CommitStash);
+        B1(body, 0x11), BU(body, stashtype), B1(body, 0x00);
+        B1(body, 0x0b);
         break;
       case kIrSkipZ:
       case kIrSkipNz:
       case kIrSkipCmp:
         // execute the next jump only when the skip condition does not hold
-        if (i + 1 >= n) goto Fail;
-        EmitSkipCond(&body, ir);
-        B1(&body, 0x45);                  // i32.eqz
-        B1(&body, 0x04), B1(&body, 0x40);  // if
-        if (!EmitJump(&body, ++ir, pathtype, targettype)) goto Fail;
-        B1(&body, 0x0b);
+        if (i + 1 >= n) return false;
+        EmitSkipCond(body, ir);
+        B1(body, 0x45);                  // i32.eqz
+        B1(body, 0x04), B1(body, 0x40);  // if
+        if (!EmitJump(body, ++ir, pathtype, targettype)) return false;
+        B1(body, 0x0b);
         ++i;
         break;
       default:
-        if (!EmitJump(&body, ir, pathtype, targettype)) goto Fail;
+        if (!EmitJump(body, ir, pathtype, targettype)) return false;
         break;
     }
   }
-  B1(&body, 0x0b);  // end function (falling off the end returns to the interpreter)
-  if (g_ntypes < 0) goto Fail;
+  B1(body, 0x0b);  // end function (falling off the end returns to the interpreter)
+  return pathtype >= 0 && targettype >= 0 && stashtype >= 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// batching
+//
+// The browser's fixed cost per module (~50 us, validation included) is several
+// times the cost of compiling a typical path, so finished paths wait in a batch
+// (interpreted meanwhile) and are compiled together as one module. The batch is
+// flushed when full, or once its paths have been reached kBatchHits times in
+// all, which bounds how long hot code waits.
+
+#define kBatchMax  26  // export names are one letter
+#define kBatchHits 256
+
+static struct Buf g_batch;  // function bodies, each size-prefixed
+static i64 g_batch_virt[kBatchMax];
+static int g_batch_n;
+static unsigned g_batch_hits;
+
+static void WinixJitPending(P);
+static void WinixJitNever(P);
+
+static void ResetBatch(void) {
+  g_batch.n = 0;
+  g_batch_n = 0;
+  g_batch_hits = 0;
+  g_ntypes = 0;
+}
+
+static void FlushBatch(void) {
+  int k;
+  uintptr_t fn;
+  struct Buf mod = {0}, sec = {0};
+  static const u8 kHeader[] = {0, 'a', 's', 'm', 1, 0, 0, 0};
+  if (!g_batch_n) return;
+  double t0 = NowMs();
   BN(&mod, kHeader, sizeof(kHeader));
   BU(&sec, g_ntypes);
-  for (i = 0; i < g_ntypes; ++i) EmitType(&sec, g_types[i]);
+  for (k = 0; k < g_ntypes; ++k) EmitType(&sec, g_types[k]);
   BSection(&mod, 1, &sec);
   BU(&sec, 3);  // imports: env.memory (shared), env.table, env.sp (the program's __stack_pointer)
   BU(&sec, 3), BN(&sec, "env", 3), BU(&sec, 6), BN(&sec, "memory", 6);
@@ -1192,20 +1234,40 @@ static uintptr_t Compile(long n) {
   BU(&sec, 3), BN(&sec, "env", 3), BU(&sec, 2), BN(&sec, "sp", 2);
   B1(&sec, 0x03), B1(&sec, 0x7f), B1(&sec, 0x01);
   BSection(&mod, 2, &sec);
-  BU(&sec, 1), BU(&sec, pathtype);
+  BU(&sec, g_batch_n);
+  for (k = 0; k < g_batch_n; ++k) BU(&sec, TypeIndex(kSigPath));
   BSection(&mod, 3, &sec);
-  BU(&sec, 1), BU(&sec, 1), B1(&sec, 'f'), B1(&sec, 0x00), BU(&sec, 0);
+  BU(&sec, g_batch_n);  // exports "a", "b", ...: installed in this order
+  for (k = 0; k < g_batch_n; ++k) BU(&sec, 1), B1(&sec, 'a' + k), B1(&sec, 0x00), BU(&sec, k);
   BSection(&mod, 7, &sec);
-  BU(&sec, 1), BU(&sec, body.n), BN(&sec, body.p, body.n);
+  BU(&sec, g_batch_n), BN(&sec, g_batch.p, g_batch.n);
   BSection(&mod, 10, &sec);
+  g_stats.bytes += mod.n;
+  double t1 = NowMs();
   fn = (uintptr_t)winix_jit_compile(mod.p, mod.n);
-  free(mod.p), free(sec.p), free(body.p);
-  if (fn == (uintptr_t)-1 || !fn) return 0;
-  if (!g_first_compiled) g_first_compiled = fn;
-  return fn;
-Fail:
-  free(mod.p), free(sec.p), free(body.p);
-  return 0;
+  g_stats.wasm_ms += NowMs() - t1;
+  free(mod.p), free(sec.p);
+  for (k = 0; k < g_batch_n; ++k) {
+    // a path whose code changed while it waited (ResetJitPage) is dropped
+    struct Hook *h = FindHook(g_batch_virt[k], false);
+    if (!h || h->fn != (uintptr_t)WinixJitPending) continue;
+    h->fn = fn == (uintptr_t)-1 || !fn ? (uintptr_t)WinixJitNever : fn + k;
+  }
+  if (fn == (uintptr_t)-1 || !fn) {
+    g_stats.failed += g_batch_n;
+  } else {
+    if (!g_first_compiled) g_first_compiled = fn;
+    g_stats.paths += g_batch_n;
+    ++g_stats.batches;
+  }
+  ResetBatch();
+  g_stats.ms += NowMs() - t0;
+}
+
+// The hook of a path waiting in the batch.
+static void WinixJitPending(P) {
+  if (++g_batch_hits >= kBatchHits) FlushBatch();
+  JitlessDispatch(A);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1223,7 +1285,8 @@ bool AbandonJit(struct Jit *jit, struct JitBlock *jb) {
 }
 
 bool FinishJit(struct Jit *jit, struct JitBlock *jb) {
-  uintptr_t fn;
+  struct Buf body = {0};
+  long n = jb->index / sizeof(struct Ir);
   if (!jb->virt) return AbandonJit(jit, jb);
   if (g_poisoned || jb->index > kJitBlockSize) {
     // Untranslatable: interpret this address for good instead of recording it
@@ -1233,14 +1296,21 @@ bool FinishJit(struct Jit *jit, struct JitBlock *jb) {
     SetHook(jb->virt, (uintptr_t)WinixJitNever);
     return false;
   }
+  if (g_ntypes > kMaxTypes - 32) FlushBatch();  // leave room for this path's types
   double t0 = NowMs();
-  fn = Compile(jb->index / sizeof(struct Ir));
+  bool ok = CompileBody(n, &body);
   g_stats.ms += NowMs() - t0;
-  if (!fn) return ++g_stats.failed, AbandonJit(jit, jb);
-  ++g_stats.paths;
-  g_stats.ops += jb->index / sizeof(struct Ir);
-  SetHook(jb->virt, fn);
+  if (!ok) {
+    free(body.p);
+    return ++g_stats.failed, AbandonJit(jit, jb);
+  }
+  BU(&g_batch, body.n), BN(&g_batch, body.p, body.n);
+  free(body.p);
+  g_batch_virt[g_batch_n++] = jb->virt;
+  g_stats.ops += n;
+  SetHook(jb->virt, (uintptr_t)WinixJitPending);
   jb->index = jb->start = 0;
+  if (g_batch_n >= g_batch_max) FlushBatch();
   return true;
 }
 #endif /* __wasm__ */

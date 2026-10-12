@@ -131,15 +131,16 @@ index bcd5617..fff8826 100644
    /// Callbacks from the main thread.
    const message_callbacks = {
      init: (message) => {
-@@ -453,6 +559,47 @@
+@@ -453,6 +559,49 @@
              // Exception tag for programs built with wasm setjmp/longjmp support (thrown and caught within the program).
              __c_longjmp: new WebAssembly.Tag({ parameters: ['i' + arch_bits] }),
  
 +            // JIT support (blink's wasm backend). winix_jit_compile: the program hands over a small wasm module
-+            // (exporting "f", importing env.memory and env.table); it is compiled synchronously, instantiated
-+            // against this program's memory and function table, and appended to the table. Returns the table
-+            // index, i.e. a C function pointer, or -1. winix_jit_fntype: the wasm signature of one of the program's
-+            // functions, by function pointer (see parse_user_signatures), or -1.
++            // (exporting one or more functions, importing env.memory and env.table); it is compiled synchronously,
++            // instantiated against this program's memory and function table, and its exports are appended to the
++            // table in order. Returns the first one's table index, i.e. a C function pointer, or -1.
++            // winix_jit_fntype: the wasm signature of one of the program's functions, by function pointer (see
++            // parse_user_signatures), or -1.
 +            winix_jit_compile: (bytes, length) => {
 +              try {
 +                const table = user_executable_imports.env.__indirect_function_table;
@@ -147,8 +148,9 @@ index bcd5617..fff8826 100644
 +                const instance = new WebAssembly.Instance(module, {
 +                  env: { memory: memory, table: table, sp: user_executable_imports.env.__stack_pointer },
 +                });
-+                const index = table.grow(1);
-+                table.set(index, instance.exports.f);
++                const names = WebAssembly.Module.exports(module).map((e) => e.name);
++                const index = table.grow(names.length);
++                names.forEach((name, k) => table.set(index + k, instance.exports[name]));
 +                return index;
 +              } catch (error) {
 +                log("winix_jit_compile: " + error);
