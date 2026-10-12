@@ -1,0 +1,592 @@
+diff --git a/archival/libarchive/data_extract_to_command.c b/archival/libarchive/data_extract_to_command.c
+index f8b2ff8..fffd75f 100644
+--- a/archival/libarchive/data_extract_to_command.c
++++ b/archival/libarchive/data_extract_to_command.c
+@@ -3,6 +3,7 @@
+  * Licensed under GPLv2 or later, see file LICENSE in this source tree.
+  */
+ #include "libbb.h"
++#include <sched.h>
+ #include "bb_archive.h"
+ 
+ enum {
+@@ -58,6 +59,44 @@ static void oct2env(char *env[], int idx, unsigned long val)
+ 	xputenv(env[idx]);
+ }
+ 
++struct extract_child_args {
++	archive_handle_t *archive_handle;
++	char **tar_env;
++	int *p;
++};
++
++static int extract_child(void *arg)
++{
++	struct extract_child_args *a = arg;
++	archive_handle_t *archive_handle = a->archive_handle;
++	file_header_t *file_header = archive_handle->file_header;
++	char **tar_env = a->tar_env;
++	int *p = a->p;
++
++	/* Child */
++	/* str2env(tar_env, TAR_FILETYPE, "f"); - parent should do it once */
++	oct2env(tar_env, TAR_MODE, file_header->mode);
++	str2env(tar_env, TAR_FILENAME, file_header->name);
++	str2env(tar_env, TAR_REALNAME, file_header->name);
++#if ENABLE_FEATURE_TAR_UNAME_GNAME
++	str2env(tar_env, TAR_UNAME, file_header->tar__uname);
++	str2env(tar_env, TAR_GNAME, file_header->tar__gname);
++#endif
++	dec2env(tar_env, TAR_SIZE, file_header->size);
++	dec2env(tar_env, TAR_UID, file_header->uid);
++	dec2env(tar_env, TAR_GID, file_header->gid);
++	close(p[1]);
++	xdup2(p[0], STDIN_FILENO);
++	signal(SIGPIPE, SIG_DFL);
++	execl(archive_handle->tar__to_command_shell,
++		archive_handle->tar__to_command_shell,
++		"-c",
++		archive_handle->tar__to_command,
++		(char *)0);
++	bb_perror_msg_and_die("can't execute '%s'", archive_handle->tar__to_command_shell);
++	return 1;
++}
++
+ void FAST_FUNC data_extract_to_command(archive_handle_t *archive_handle)
+ {
+ 	file_header_t *file_header = archive_handle->file_header;
+@@ -81,29 +120,11 @@ void FAST_FUNC data_extract_to_command(archive_handle_t *archive_handle)
+ 		memset(tar_env, 0, sizeof(tar_env));
+ 
+ 		xpipe(p);
+-		pid = BB_MMU ? xfork() : xvfork();
+-		if (pid == 0) {
+-			/* Child */
+-			/* str2env(tar_env, TAR_FILETYPE, "f"); - parent should do it once */
+-			oct2env(tar_env, TAR_MODE, file_header->mode);
+-			str2env(tar_env, TAR_FILENAME, file_header->name);
+-			str2env(tar_env, TAR_REALNAME, file_header->name);
+-#if ENABLE_FEATURE_TAR_UNAME_GNAME
+-			str2env(tar_env, TAR_UNAME, file_header->tar__uname);
+-			str2env(tar_env, TAR_GNAME, file_header->tar__gname);
+-#endif
+-			dec2env(tar_env, TAR_SIZE, file_header->size);
+-			dec2env(tar_env, TAR_UID, file_header->uid);
+-			dec2env(tar_env, TAR_GID, file_header->gid);
+-			close(p[1]);
+-			xdup2(p[0], STDIN_FILENO);
+-			signal(SIGPIPE, SIG_DFL);
+-			execl(archive_handle->tar__to_command_shell,
+-				archive_handle->tar__to_command_shell,
+-				"-c",
+-				archive_handle->tar__to_command,
+-				(char *)0);
+-			bb_perror_msg_and_die("can't execute '%s'", archive_handle->tar__to_command_shell);
++		{
++			struct extract_child_args args = { archive_handle, tar_env, p };
++			pid = clone(extract_child, NULL, CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
++			if (pid < 0)
++				bb_simple_perror_msg_and_die("clone");
+ 		}
+ 		close(p[0]);
+ 		/* Our caller is expected to do signal(SIGPIPE, SIG_IGN)
+diff --git a/archival/libarchive/open_transformer.c b/archival/libarchive/open_transformer.c
+index d311750..83004aa 100644
+--- a/archival/libarchive/open_transformer.c
++++ b/archival/libarchive/open_transformer.c
+@@ -156,8 +156,11 @@ void FAST_FUNC fork_transformer(int fd, const char *transform_prog)
+ 		/* notreached */
+ 	}
+ #else
+-	void *arg[2] = {&fd, transform_prog, &fd_pipe};
+-	clone(fork_transformer_child, NULL, CLONE_VM | CLONE_VFORK | SIGCHLD, arg);
++	/* (upstream had void *arg[2] with three initializers) */
++	void *arg[3] = {&fd, (void *)transform_prog, &fd_pipe};
++	pid = clone(fork_transformer_child, NULL, CLONE_VM | CLONE_VFORK | SIGCHLD, arg);
++	if (pid < 0)
++		bb_simple_perror_msg_and_die("clone");
+ #endif
+ 
+ 	/* parent process */
+diff --git a/archival/tar.c b/archival/tar.c
+index 9de3759..a107b41 100644
+--- a/archival/tar.c
++++ b/archival/tar.c
+@@ -117,6 +117,7 @@
+ 
+ #include <fnmatch.h>
+ #include "libbb.h"
++#include <sched.h>
+ #include "common_bufsiz.h"
+ #include "bb_archive.h"
+ /* FIXME: Stop using this non-standard feature */
+@@ -569,6 +570,39 @@ static int FAST_FUNC writeFileToTarball(struct recursive_state *state,
+ }
+ 
+ # if SEAMLESS_COMPRESSION
++struct compressor_args {
++	struct fd_pair *data;
++	int tar_fd;
++	const char *gzip;
++	volatile int *exec_errno;
++};
++
++static int compressor_child(void *arg)
++{
++	struct compressor_args *a = arg;
++	struct fd_pair *data = a->data;
++	const char *gzip = a->gzip;
++	int tfd;
++
++	/* NB: close _first_, then move fds! */
++	close(data->wr);
++	/* copy it: parent's tar_fd variable must not change */
++	tfd = a->tar_fd;
++	if (tfd == 0) {
++		/* Output tar fd may be zero.
++		 * xmove_fd(data.rd, 0) would destroy it. */
++		tfd = dup(tfd);
++	}
++	xmove_fd(data->rd, 0);
++	xmove_fd(tfd, 1);
++
++	/* exec gzip/bzip2/... program (not an applet: see upstream comment) */
++	execlp(gzip, gzip, "-f", (char *)0);
++
++	*a->exec_errno = errno;
++	_exit(EXIT_FAILURE);
++}
++
+ /* Don't inline: vfork scares gcc and pessimizes code */
+ static void NOINLINE vfork_compressor(int tar_fd, const char *gzip)
+ {
+@@ -585,43 +619,10 @@ static void NOINLINE vfork_compressor(int tar_fd, const char *gzip)
+ 
+ 	signal(SIGPIPE, SIG_IGN); /* we only want EPIPE on errors */
+ 
+-	if (xvfork() == 0) {
+-		/* child */
+-		int tfd;
+-		/* NB: close _first_, then move fds! */
+-		close(data.wr);
+-#  if WAIT_FOR_CHILD
+-		close(status.rd);
+-		/* status.wr will close only on exec -
+-		 * parent waits for this close to happen */
+-		fcntl(status.wr, F_SETFD, FD_CLOEXEC);
+-#  endif
+-		/* copy it: parent's tar_fd variable must not change */
+-		tfd = tar_fd;
+-		if (tfd == 0) {
+-			/* Output tar fd may be zero.
+-			 * xmove_fd(data.rd, 0) would destroy it.
+-			 * Reproducer:
+-			 *  exec 0>&-
+-			 *  exec 1>&-
+-			 *  tar czf Z.tar.gz FILE
+-			 * Swapping move_fd's order wouldn't work:
+-			 * data.rd is 1 and _it_ would be destroyed.
+-			 */
+-			tfd = dup(tfd);
+-		}
+-		xmove_fd(data.rd, 0);
+-		xmove_fd(tfd, 1);
+-
+-		/* exec gzip/bzip2/... program */
+-		//BB_EXECLP(gzip, gzip, "-f", (char *)0); - WRONG for "xz",
+-		// if xz is an enabled applet, it'll be a version which
+-		// can only decompress. We do need to execute external
+-		// program, not applet.
+-		execlp(gzip, gzip, "-f", (char *)0);
+-
+-		vfork_exec_errno = errno;
+-		_exit(EXIT_FAILURE);
++	{
++		struct compressor_args args = { &data, tar_fd, gzip, &vfork_exec_errno };
++		if (clone(compressor_child, NULL, CLONE_VM | CLONE_VFORK | SIGCHLD, &args) < 0)
++			bb_simple_perror_msg_and_die("clone");
+ 	}
+ 
+ 	/* parent */
+diff --git a/coreutils/timeout.c b/coreutils/timeout.c
+index 06108f3..65e43c8 100644
+--- a/coreutils/timeout.c
++++ b/coreutils/timeout.c
+@@ -46,6 +46,7 @@
+ //usage:       "If it still exists in KILL_SECS seconds, send KILL.\n"
+ 
+ #include "libbb.h"
++#include <sched.h>
+ 
+ static NOINLINE int timeout_wait(int timeout, pid_t pid)
+ {
+@@ -62,6 +63,38 @@ static NOINLINE int timeout_wait(int timeout, pid_t pid)
+ 	return EXIT_FAILURE;
+ }
+ 
++struct timeout_child_args {
++	const char *opt_s;
++	const char *opt_k;
++	const char *secs;
++};
++
++static int timeout_child(void *arg)
++{
++	struct timeout_child_args *a = arg;
++	/* Child: spawn grandchild and exit */
++	/* Command line for the re-exec'ed grandchild (options must precede SECS,
++	 * a dummy PROG is needed to get past the usage check) */
++	char name[] = "timeout";
++	char *argv[8];
++	int n = 0;
++
++	argv[n++] = name;
++	argv[n++] = (char *)"-s";
++	argv[n++] = (char *)a->opt_s;
++	if (a->opt_k) {
++		argv[n++] = (char *)"-k";
++		argv[n++] = (char *)a->opt_k;
++	}
++	argv[n++] = xasprintf("-p%u", (unsigned)getppid());
++	argv[n++] = (char *)a->secs;
++	argv[n++] = name;
++	argv[n] = NULL;
++	/* NB: exits with nonzero on error: */
++	bb_daemonize_or_rexec(0, argv);
++	return 0;
++}
++
+ int timeout_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int timeout_main(int argc UNUSED_PARAM, char **argv)
+ {
+@@ -71,9 +104,6 @@ int timeout_main(int argc UNUSED_PARAM, char **argv)
+ 	int timeout;
+ 	int kill_timeout;
+ 	pid_t pid;
+-#if !BB_MMU
+-	char *sv1, *sv2;
+-#endif
+ 	const char *opt_s = "TERM";
+ 	char *opt_k = NULL;
+ 
+@@ -109,22 +139,15 @@ int timeout_main(int argc UNUSED_PARAM, char **argv)
+ 	if (parent) /* we were re-execed, already grandchild */
+ 		goto grandchild;
+ 
+-#if !BB_MMU
+-	sv1 = argv[optind];
+-	sv2 = argv[optind + 1];
+-#endif
+-	pid = xvfork();
+-	if (pid == 0) {
+-		/* Child: spawn grandchild and exit */
+-		parent = getppid();
+-#if !BB_MMU
+-		argv[optind] = xasprintf("-p%u", parent);
+-		argv[optind + 1] = NULL;
+-#endif
+-		/* NB: exits with nonzero on error: */
+-		bb_daemonize_or_rexec(0, argv);
+-		/* Here we are grandchild. Sleep, then kill grandparent */
++	{
++		struct timeout_child_args args = { opt_s, opt_k, argv[optind - 1] };
++		pid = clone(timeout_child, NULL, CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
++		if (pid < 0)
++			bb_simple_perror_msg_and_die("clone");
++	}
++	if (0) {
+  grandchild:
++		/* Here we are grandchild. Sleep, then kill grandparent */
+ 		if (timeout_wait(timeout, parent) == EXIT_SUCCESS)
+ 			return EXIT_SUCCESS;
+ 		kill(parent, signo);
+@@ -145,9 +168,5 @@ int timeout_main(int argc UNUSED_PARAM, char **argv)
+ 		return EXIT_FAILURE;
+ 	/* Ok, exec a program as requested */
+ 	argv += optind;
+-#if !BB_MMU
+-	argv[0] = sv1;
+-	argv[1] = sv2;
+-#endif
+ 	BB_EXECVP_or_die(argv);
+ }
+diff --git a/libbb/vfork_daemon_rexec.c b/libbb/vfork_daemon_rexec.c
+index 7914193..dbc47f6 100644
+--- a/libbb/vfork_daemon_rexec.c
++++ b/libbb/vfork_daemon_rexec.c
+@@ -17,6 +17,8 @@
+ #include "busybox.h" /* uses applet tables */
+ #include "NUM_APPLETS.h"
+ 
++#include <sched.h>
++
+ #define NOFORK_SUPPORT ((NUM_APPLETS > 1) && (ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_NOFORK))
+ #define NOEXEC_SUPPORT ((NUM_APPLETS > 1) && (ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_STANDALONE))
+ 
+@@ -173,32 +175,42 @@ void FAST_FUNC run_noexec_applet_and_exit(int a, const char *name, char **argv)
+ 
+ /* This does a fork/exec in one call, using vfork().  Returns PID of new child,
+  * -1 for failure.  Runs argv[0], searching path if that has no / in it. */
++struct spawn_child_args {
++	char **argv;
++	volatile int *failed;
++};
++
++static int spawn_child(void *arg)
++{
++	struct spawn_child_args *a = arg;
++
++	/* This macro is ok - it doesn't do NOEXEC/NOFORK tricks */
++	BB_EXECVP(a->argv[0], a->argv);
++
++	/* We are sharing memory with blocked parent,
++	 * let parent know we failed and then exit to unblock parent
++	 * (but don't run atexit() stuff, which would screw up parent.)
++	 */
++	*a->failed = errno;
++	/* mount, for example, does not want the message */
++	/*bb_perror_msg("can't execute '%s'", argv[0]);*/
++	_exit(111);
++}
++
+ pid_t FAST_FUNC spawn(char **argv)
+ {
+ 	/* Compiler should not optimize stores here */
+ 	volatile int failed;
+ 	pid_t pid;
++	struct spawn_child_args args = { argv, &failed };
+ 
+ 	fflush_all();
+ 
+ 	/* Be nice to nommu machines. */
+ 	failed = 0;
+-	pid = vfork();
++	pid = clone(spawn_child, NULL, CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
+ 	if (pid < 0) /* error */
+ 		return pid;
+-	if (!pid) { /* child */
+-		/* This macro is ok - it doesn't do NOEXEC/NOFORK tricks */
+-		BB_EXECVP(argv[0], argv);
+-
+-		/* We are (maybe) sharing a stack with blocked parent,
+-		 * let parent know we failed and then exit to unblock parent
+-		 * (but don't run atexit() stuff, which would screw up parent.)
+-		 */
+-		failed = errno;
+-		/* mount, for example, does not want the message */
+-		/*bb_perror_msg("can't execute '%s'", argv[0]);*/
+-		_exit(111);
+-	}
+ 	/* parent */
+ 	/* Unfortunately, this is not reliable: according to standards
+ 	 * vfork() can be equivalent to fork() and we won't see value
+@@ -258,6 +270,13 @@ void FAST_FUNC re_exec(char **argv)
+ 	bb_perror_msg_and_die("can't execute '%s'", bb_busybox_exec_path);
+ }
+ 
++static int re_exec_child(void *arg)
++{
++	/* child - re-exec ourself */
++	re_exec(arg);
++	return 1;
++}
++
+ pid_t FAST_FUNC fork_or_rexec(char **argv)
+ {
+ 	pid_t pid;
+@@ -267,11 +286,10 @@ pid_t FAST_FUNC fork_or_rexec(char **argv)
+ 
+ 	/* fflush_all(); ? - so far all callers had no buffered output to flush */
+ 
+-	pid = xvfork();
+-	if (pid) /* parent */
+-		return pid;
+-	/* child - re-exec ourself */
+-	re_exec(argv);
++	pid = clone(re_exec_child, NULL, CLONE_VM | CLONE_VFORK | SIGCHLD, argv);
++	if (pid < 0)
++		bb_simple_perror_msg_and_die("clone");
++	return pid;
+ }
+ #endif
+ 
+diff --git a/miscutils/time.c b/miscutils/time.c
+index c4bcbcb..39298b4 100644
+--- a/miscutils/time.c
++++ b/miscutils/time.c
+@@ -32,6 +32,7 @@
+ //usage:     "\n	-a	Append (else overwrite)"
+ 
+ #include "libbb.h"
++#include <sched.h>
+ 
+ #ifndef HAVE_WAIT3
+ static pid_t wait3(int *status, int options, struct rusage *rusage)
+@@ -397,6 +398,12 @@ static void summarize(const char *fmt, char **command, resource_t *resp)
+ 	bb_putchar('\n');
+ }
+ 
++static int time_child(void *arg)
++{
++	BB_EXECVP_or_die((char**)arg);
++	return 1;
++}
++
+ /* Run command CMD and return statistics on it.
+    Put the statistics in *RESP.  */
+ static void run_command(char *const *cmd, resource_t *resp)
+@@ -406,11 +413,9 @@ static void run_command(char *const *cmd, resource_t *resp)
+ 	void (*quit_signal)(int);
+ 
+ 	resp->elapsed_ms = monotonic_ms();
+-	pid = xvfork();
+-	if (pid == 0) {
+-		/* Child */
+-		BB_EXECVP_or_die((char**)cmd);
+-	}
++	pid = clone(time_child, NULL, CLONE_VM | CLONE_VFORK | SIGCHLD, (void *)cmd);
++	if (pid < 0)
++		bb_simple_perror_msg_and_die("clone");
+ 
+ 	/* Have signals kill the child but not self (if possible).  */
+ //TODO: just block all sigs? and re-enable them in the very end in main?
+diff --git a/shell/hush.c b/shell/hush.c
+index c634ffa..c999ebc 100644
+--- a/shell/hush.c
++++ b/shell/hush.c
+@@ -7603,17 +7603,15 @@ static void parse_and_run_file(HFILE *fp)
+ }
+ 
+ #if ENABLE_HUSH_TICK
+-static int generate_stream_from_string(const char *s, pid_t *pid_p)
++static int generate_stream_child(void *arg)
+ {
+-	pid_t pid;
+-	int channel[2];
++	void **args = arg;
++	const char *s = args[0];
++	int *channel = args[1];
+ # if !BB_MMU
+-	char **to_free = NULL;
++	char ***to_free = args[2];
+ # endif
+-
+-	xpipe(channel);
+-	pid = BB_MMU ? xfork() : xvfork();
+-	if (pid == 0) { /* child */
++	{ /* child */
+ 		disable_restore_tty_pgrp_on_exit();
+ 		/* Process substitution is not considered to be usual
+ 		 * 'command execution'.
+@@ -7686,13 +7684,41 @@ static int generate_stream_from_string(const char *s, pid_t *pid_p)
+ 	 * huge=`cat BIG` # was blocking here forever
+ 	 * echo OK
+ 	 */
+-		re_execute_shell(&to_free,
++		re_execute_shell(to_free,
+ 				s,
+ 				G.global_argv[0],
+ 				G.global_argv + 1,
+ 				NULL);
+ # endif
+ 	}
++	return 1;
++}
++
++static int generate_stream_from_string(const char *s, pid_t *pid_p)
++{
++	pid_t pid;
++	int channel[2];
++# if !BB_MMU
++	char **to_free = NULL;
++# endif
++	void *arg[] = {
++		(void *)s,
++		channel,
++# if !BB_MMU
++		&to_free,
++# endif
++	};
++
++	xpipe(channel);
++# if BB_MMU
++	pid = xfork();
++	if (pid == 0)
++		generate_stream_child(arg);
++# else
++	pid = clone(generate_stream_child, NULL, CLONE_VM | CLONE_VFORK | SIGCHLD, arg);
++	if (pid < 0)
++		bb_simple_perror_msg_and_die("clone");
++# endif
+ 
+ 	/* parent */
+ 	*pid_p = pid;
+@@ -7747,6 +7773,33 @@ static int process_command_subs(o_string *dest, const char *s)
+ #endif /* ENABLE_HUSH_TICK */
+ 
+ 
++#if !BB_MMU
++struct heredoc_child_args {
++	struct redir_struct *redir;
++	struct fd_pair *pair;
++	const char *heredoc;
++	char ***to_free;
++};
++
++static int heredoc_grandchild(void *arg)
++{
++	struct heredoc_child_args *a = arg;
++	/* grandchild */
++	close(a->redir->rd_fd); /* read side of the pipe */
++	/* Delegate blocking writes to another process */
++	xmove_fd(a->pair->wr, STDOUT_FILENO);
++	re_execute_shell(a->to_free, a->heredoc, NULL, NULL, NULL);
++	return 1;
++}
++
++static int heredoc_child(void *arg)
++{
++	disable_restore_tty_pgrp_on_exit();
++	clone(heredoc_grandchild, NULL, CLONE_VM | CLONE_VFORK | SIGCHLD, arg);
++	return 0;
++}
++#endif
++
+ static void setup_heredoc(struct redir_struct *redir)
+ {
+ 	struct fd_pair pair;
+@@ -7795,25 +7848,26 @@ static void setup_heredoc(struct redir_struct *redir)
+ 	 * (that exec happens after we return from this function) */
+ #if !BB_MMU
+ 	to_free = NULL;
+-#endif
++	{
++		struct heredoc_child_args args = { redir, &pair, heredoc, &to_free };
++		pid = clone(heredoc_child, NULL, CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
++		if (pid < 0)
++			bb_simple_perror_msg_and_die("clone");
++	}
++#else
+ 	pid = xvfork();
+ 	if (pid == 0) {
+ 		/* child */
+ 		disable_restore_tty_pgrp_on_exit();
+-		pid = BB_MMU ? xfork() : xvfork();
++		pid = xfork();
+ 		if (pid != 0)
+ 			_exit(0);
+ 		/* grandchild */
+ 		close(redir->rd_fd); /* read side of the pipe */
+-#if BB_MMU
+ 		full_write(pair.wr, heredoc, len); /* may loop or block */
+ 		_exit(0);
+-#else
+-		/* Delegate blocking writes to another process */
+-		xmove_fd(pair.wr, STDOUT_FILENO);
+-		re_execute_shell(&to_free, heredoc, NULL, NULL, NULL);
+-#endif
+ 	}
++#endif
+ 	/* parent */
+ #if ENABLE_HUSH_FAST
+ 	G.count_SIGCHLD++;

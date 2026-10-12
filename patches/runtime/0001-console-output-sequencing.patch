@@ -1,0 +1,112 @@
+diff --git a/runtime/linux-worker.js b/runtime/linux-worker.js
+index aee2580..3831ef7 100644
+--- a/runtime/linux-worker.js
++++ b/runtime/linux-worker.js
+@@ -7,6 +7,8 @@
+   let Ulong;
+   let memory = null;  // Note: memory.buffer has to be re-accessed after growing the memory!
+   let locks = null;
++  /// Shared counter that orders console chunks across workers (see linux.js).
++  let console_seq = null;
+   const text_decoder = new TextDecoder("utf-8");
+   const text_encoder = new TextEncoder();
+ 
+@@ -238,10 +240,14 @@
+     wasm_driver_hvc_put: (buffer, count) => {
+       const memory_u8 = new Uint8Array(memory.buffer);
+ 
++      // The sequence number orders chunks across workers; raw bytes are decoded (once) on the main thread.
++      const seq = Atomics.add(console_seq, 0, 1);
++      const data = memory_u8.slice(buffer, buffer + count);
+       port.postMessage({
+         method: "console_write",
+-        message: text_decoder.decode(memory_u8.slice(buffer, buffer + count)),
+-      });
++        seq: seq,
++        data: data,
++      }, [data.buffer]);
+ 
+       return count;
+     },
+@@ -288,6 +294,7 @@
+       runner_name = message.runner_name;
+       memory = message.memory;
+       locks = message.locks;
++      console_seq = message.console_seq;
+       switch_to_last_task = message.last_task; // Only defined for tasks and CPU 0 (init task).
+ 
+       if (message.user_executable) {
+diff --git a/runtime/linux.js b/runtime/linux.js
+index 5d32953..02d3522 100644
+--- a/runtime/linux.js
++++ b/runtime/linux.js
+@@ -14,6 +14,39 @@ const linux = async (worker_url, variant, vmlinux, boot_cmdline, initrd, log, co
+   /// Input buffer (from keyboard to tty).
+   let input_buffer = new ArrayBuffer(0);
+ 
++  /// Console output ordering. Every worker stamps its console chunks from this shared counter (the kernel holds the
++  /// hvc lock across put_chars, so counter order is output order), but chunks posted by different workers can arrive
++  /// here out of order. They are buffered and delivered by sequence number, as bytes, through one streaming decoder.
++  const console_seq = new Int32Array(new SharedArrayBuffer(4));
++  const console_decoder = new TextDecoder("utf-8");
++  const console_pending = new Map();
++  const console_stats = { chunks: 0, out_of_order: 0, gap_skips: 0 };
++  let console_next = 0;
++  let console_gap_timer = null;
++
++  const console_flush = () => {
++    while (console_pending.has(console_next)) {
++      const data = console_pending.get(console_next);
++      console_pending.delete(console_next);
++      console_next++;
++      console_write(console_decoder.decode(data, { stream: true }));
++    }
++    if (console_pending.size === 0) {
++      clearTimeout(console_gap_timer);
++      console_gap_timer = null;
++    } else if (console_gap_timer === null) {
++      // A worker died between taking a sequence number and posting: do not stall forever.
++      console_gap_timer = setTimeout(() => {
++        console_gap_timer = null;
++        if (console_pending.size > 0) {
++          console_next = Math.min(...console_pending.keys());
++          console_stats.gap_skips++;
++          console_flush();
++        }
++      }, 1000);
++    }
++  };
++
+   const text_decoder = new TextDecoder("utf-8");
+   const text_encoder = new TextEncoder();
+ 
+@@ -107,7 +140,12 @@ const linux = async (worker_url, variant, vmlinux, boot_cmdline, initrd, log, co
+     },
+ 
+     console_write: (message) => {
+-      console_write(message.message);
++      console_stats.chunks++;
++      if (message.seq !== console_next) {
++        console_stats.out_of_order++;
++      }
++      console_pending.set(message.seq, message.data);
++      console_flush();
+     },
+ 
+     log: (message) => {
+@@ -216,6 +254,7 @@ const linux = async (worker_url, variant, vmlinux, boot_cmdline, initrd, log, co
+     worker.postMessage({
+       ...options,
+       method: "init",
++      console_seq: console_seq,
+       variant: variant,
+       vmlinux: vmlinux,
+       memory: memory,
+@@ -237,6 +276,7 @@ const linux = async (worker_url, variant, vmlinux, boot_cmdline, initrd, log, co
+   make_cpu(0);
+ 
+   return {
++    console_stats: console_stats,
+     key_input: (data) => {
+       const key_buffer = text_encoder.encode(data);  // Possibly UTF-8 (up to 16 bits).
+ 

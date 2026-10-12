@@ -1,0 +1,14 @@
+diff --git a/fs/binfmt_wasm.c b/fs/binfmt_wasm.c
+index ccc48e9d3..c2d895aec 100644
+--- a/fs/binfmt_wasm.c
++++ b/fs/binfmt_wasm.c
+@@ -20,7 +20,8 @@
+ #include <linux/uaccess.h>
+ #include <linux/vmalloc.h>
+ 
+-#define WASM_STACK_SIZE		(2UL * PAGE_SIZE)
++/* The default 8 KiB overflows in hush/awk/etc. and corrupts neighbouring memory */
++#define WASM_STACK_SIZE		(256UL * 1024)
+ 
+ /*
+  * Userland expects the stack to be page aligned as of now, which allows it to
