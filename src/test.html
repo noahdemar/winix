@@ -231,6 +231,21 @@ echo "it's"`;
     const r = await w.exec(`curl -si -X POST -d a=1 ${location.origin}/machine.html | head -n 1`);
     eq(/^HTTP\/1\.1 \d{3} /.test(r.stdout), true, 'status line ' + JSON.stringify(r.stdout));
   }],
+  ['36 apt-get install sqlite, file database', async () => {
+    const r = await w.exec('apt-get install -y sqlite', { timeoutMs: 60000 });
+    eq(r.exitCode, 0, 'exit, stderr ' + r.stderr);
+    await w.exec(`sqlite3 /work/t.db "create table t(x); insert into t values (1),(2),(3);"`);
+    const q = await w.exec(`sqlite3 /work/t.db "select sum(x) from t;"`);
+    eq(q.stdout, '6\n', 'sqlite ' + q.stderr);
+    eq((await w.exec('apt list --installed')).stdout, 'sqlite/winix 3.47.2 wasm32 [installed]\n');
+  }],
+  ['37 apt unknown package, remove', async () => {
+    const r = await w.exec('apt install -y nope');
+    eq(r.exitCode, 100);
+    eq(r.stderr.includes('E: Unable to locate package nope'), true, 'stderr ' + r.stderr);
+    await w.exec('apt remove -y sqlite');
+    eq((await w.exec('command -v sqlite3 || echo gone')).stdout, 'gone\n');
+  }],
 ];
 
 for (const [name, fn] of cases) {

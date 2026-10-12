@@ -5,11 +5,13 @@
 #   kernel   apply patches, rebuild kernel only -> dist/vmlinux-*.wasm
 #   busybox  apply patches/config, rebuild busybox + initramfs (+ overlay) -> dist/initramfs-*.cpio.gz
 #   quickjs  rebuild qjs, repack initramfs with the overlay
-#   guest    rebuild winixd + curl (guest/), repack initramfs with the overlay
+#   guest    rebuild winixd + curl + apt (guest/), repack initramfs with the overlay
+#   packages [name...]  build the apt repository (packages/*.sh) into dist/pkgs/
 # Builds on the native Linux fs (~/winix-build) because /mnt/c is slow and paths must not contain spaces.
 set -euo pipefail
 
 TARGET="${1:-all}"
+shift || true
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUB="$REPO/third_party/linux-wasm"
 BUILD_ROOT="${WINIX_BUILD:-$HOME/winix-build}"
@@ -93,6 +95,10 @@ case "$TARGET" in
   kernel)
     ./linux-wasm.sh build-kernel
     ;;
+  packages)
+    D="$D" "$REPO/scripts/build-packages.sh" "$@"
+    exit
+    ;;
   busybox|quickjs|guest)
     [ "$TARGET" = busybox ] && { apply_busybox_config; rm -rf "$I/busybox-$LW_VARIANT"; ./linux-wasm.sh build-busybox; }
     ./linux-wasm.sh build-initramfs
@@ -111,6 +117,7 @@ case "$TARGET" in
     "$REPO/scripts/build-quickjs.sh"
     "$REPO/scripts/build-guest.sh"
     pack_overlay
+    D="$D" "$REPO/scripts/build-packages.sh"
     # runtime/ (with patches/runtime applied) and src/ are copied by copy-src.sh below
     ;;
   *) echo "unknown target: $TARGET"; exit 1 ;;

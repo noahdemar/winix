@@ -60,6 +60,8 @@ http
       res.writeHead(404).end("not found");
       return;
     }
+    // Package archives are versioned by name, so the browser may keep them; everything else is always fresh.
+    if (/^\/pkgs\/.+_.+\.tar\.gz$/.test(rel)) res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
     res.writeHead(200, { "Content-Type": types[path.extname(file)] ?? "application/octet-stream" });
     fs.createReadStream(file).pipe(res);
   })

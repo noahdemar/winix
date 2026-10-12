@@ -1,0 +1,156 @@
+#!/bin/sh
+# apt for winix: apt/apt-get/apk-style front end to the winix package repository (wasm builds, not Debian packages).
+# Repository: $WINIX_REPO (default winix://pkgs, the pkgs/ directory next to the page) with index.txt lines
+#   name version sha256 size deps(comma-separated or -) description...
+# and archives name_version.tar.gz, unpacked at /. Installed packages: /var/lib/apt/installed/<name> (version, then files).
+
+REPO=${WINIX_REPO:-winix://pkgs}
+LIB=/var/lib/apt
+INDEX=$LIB/index.txt
+DB=$LIB/installed
+PROG=${0##*/}
+mkdir -p "$DB"
+
+die() { echo "E: $*" >&2; exit 100; }
+
+update() {
+	echo "Get:1 $REPO index.txt"
+	curl -sSf -o "$INDEX.new" "$REPO/index.txt" || die "Failed to fetch $REPO/index.txt"
+	mv "$INDEX.new" "$INDEX"
+	echo "Reading package lists... Done ($(wc -l < "$INDEX") packages available)"
+}
+
+need_index() { [ -s "$INDEX" ] || update; }
+
+# field <name> <n>: field n of the package's index line (1 = name)
+field() { awk -v p="$1" -v n="$2" '$1 == p { print $n; exit }' "$INDEX"; }
+
+installed_version() { [ -f "$DB/$1" ] && head -n 1 "$DB/$1"; }
+
+install_one() {
+	pkg=$1
+	ver=$(field "$pkg" 2)
+	[ -n "$ver" ] || { echo "E: Unable to locate package $pkg" >&2; return 100; }
+	if [ "$(installed_version "$pkg")" = "$ver" ] && [ -z "$REINSTALL" ]; then
+		echo "$pkg is already the newest version ($ver)."
+		return 0
+	fi
+	deps=$(field "$pkg" 5)
+	if [ "$deps" != "-" ]; then
+		for d in $(echo "$deps" | tr ',' ' '); do install_one "$d" || return $?; done
+	fi
+	sum=$(field "$pkg" 3)
+	tmp=/tmp/apt.$$.tar.gz
+	echo "Get: $REPO/${pkg}_$ver.tar.gz [$(field "$pkg" 4) B]"
+	curl -sSf -o "$tmp" "$REPO/${pkg}_$ver.tar.gz" || { rm -f "$tmp"; die "Failed to fetch ${pkg}_$ver.tar.gz"; }
+	[ "$(sha256sum "$tmp" | cut -d ' ' -f 1)" = "$sum" ] || { rm -f "$tmp"; die "Hash sum mismatch for $pkg"; }
+	echo "Unpacking $pkg ($ver) ..."
+	[ -f "$DB/$pkg" ] && remove_files "$pkg"
+	{ echo "$ver"; tar tzf "$tmp" | grep -v '/$'; } > "$DB/$pkg.new" && tar xzf "$tmp" -C / || { rm -f "$tmp"; die "Failed to unpack $pkg"; }
+	mv "$DB/$pkg.new" "$DB/$pkg"
+	rm -f "$tmp"
+	echo "Setting up $pkg ($ver) ..."
+}
+
+remove_files() { tail -n +2 "$DB/$1" | while read -r f; do rm -f "/${f#./}"; done; }
+
+install() {
+	[ $# -gt 0 ] || die "No packages given"
+	need_index
+	missing=
+	for p; do [ -n "$(field "$p" 2)" ] || missing="$missing $p"; done
+	if [ -n "$missing" ]; then
+		for p in $missing; do echo "E: Unable to locate package $p" >&2; done
+		echo "Available: $(awk '{ printf "%s ", $1 }' "$INDEX")" >&2
+		exit 100
+	fi
+	for p; do install_one "$p" || exit $?; done
+}
+
+remove() {
+	[ $# -gt 0 ] || die "No packages given"
+	for p; do
+		[ -f "$DB/$p" ] || { echo "Package '$p' is not installed, so not removed"; continue; }
+		echo "Removing $p ($(installed_version "$p")) ..."
+		remove_files "$p"
+		rm -f "$DB/$p"
+	done
+}
+
+list() {
+	need_index
+	while read -r name ver _ _ _ desc; do
+		[ "$1" = --installed ] && [ ! -f "$DB/$name" ] && continue
+		mark=; [ -f "$DB/$name" ] && mark=" [installed]"
+		echo "$name/winix $ver wasm32$mark"
+	done < "$INDEX"
+}
+
+search() {
+	need_index
+	grep -i -- "$1" "$INDEX" | while read -r name ver _ _ _ desc; do printf '%s/winix %s\n  %s\n' "$name" "$ver" "$desc"; done
+}
+
+show() {
+	need_index
+	for p; do
+		line=$(awk -v p="$p" '$1 == p' "$INDEX")
+		[ -n "$line" ] || die "No packages found"
+		echo "$line" | { read -r name ver sum size deps desc
+			printf 'Package: %s\nVersion: %s\nDepends: %s\nSize: %s\nSHA256: %s\nDescription: %s\n\n' \
+				"$name" "$ver" "$deps" "$size" "$sum" "$desc"; }
+	done
+}
+
+upgrade() {
+	update
+	for f in "$DB"/*; do
+		[ -f "$f" ] || continue
+		p=${f##*/}
+		[ "$(installed_version "$p")" != "$(field "$p" 2)" ] && install_one "$p"
+	done
+	echo "All packages are up to date."
+}
+
+usage() {
+	echo "usage: $PROG update | install PKG... | remove PKG... | list [--installed] | search TERM | show PKG | upgrade" >&2
+	exit 1
+}
+
+# Drop options agents habitually pass (-y, -q, --no-install-recommends, ...).
+args=
+for a; do
+	case $a in
+	--reinstall) REINSTALL=1 ;;
+	--installed) args="$args $a" ;;
+	-*) ;;
+	*) args="$args $a" ;;
+	esac
+done
+set -- $args
+
+if [ "$PROG" = apk ]; then
+	cmd=$1; shift 2>/dev/null
+	case $cmd in
+	add) install "$@" ;;
+	del) remove "$@" ;;
+	update) update ;;
+	upgrade) upgrade ;;
+	search) search "$@" ;;
+	info) if [ $# -gt 0 ]; then show "$@"; else list --installed; fi ;;
+	*) echo "usage: apk add|del|update|upgrade|search|info" >&2; exit 1 ;;
+	esac
+	exit
+fi
+
+cmd=$1; shift 2>/dev/null
+case $cmd in
+update) update ;;
+install) install "$@" ;;
+remove|purge|autoremove) remove "$@" ;;
+list) list "$@" ;;
+search) search "$@" ;;
+show) show "$@" ;;
+upgrade|dist-upgrade|full-upgrade) upgrade ;;
+*) usage ;;
+esac

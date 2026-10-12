@@ -104,7 +104,6 @@ class Machine {
     this.onConsole = onConsole || (() => {});
     this.dead = null;
     this.daemon = null; // winixd's channel id
-    this.channels = new Map(); // id -> Framer
     this.pending = new Map(); // tag -> { onFrame(op, reader), reject }
     this.nextTag = 1;
     this.ready = null;
@@ -142,10 +141,7 @@ class Machine {
     this.os = await iframe.contentWindow.linux(
       new URL('linux-worker.js', this.baseUrl).href, this.variant, module, this.cmdline, initrd.slice(0),
       (t) => this.onLog(t), (d) => this.onConsole(d));
-    this.os.winix.set_handler({
-      data: (id, bytes) => this.channel(id).push(bytes),
-      close: (id) => this.channels.delete(id),
-    });
+    attachChannels(this.os, { fetch: this.fetch, baseUrl: this.baseUrl, onFrame: (...a) => this.onFrame(...a) });
     try {
       await ready;
     } finally {
@@ -153,18 +149,10 @@ class Machine {
     }
   }
 
-  channel(id) {
-    let c = this.channels.get(id);
-    if (!c) this.channels.set(id, (c = new Framer((tag, op, r) => this.onFrame(id, tag, op, r))));
-    return c;
-  }
-
   onFrame(id, tag, op, r) {
     if (op === RP.READY) {
       this.daemon = id;
       this.ready?.resolve();
-    } else if (op === OP.FETCH) {
-      this.serveFetch(id, tag, r);
     } else if (id === this.daemon) {
       this.pending.get(tag)?.onFrame(op, r);
     }
@@ -200,9 +188,15 @@ class Machine {
     });
   }
 
-  /// A guest client's HTTP request, made with the page's fetch and streamed back.
-  async serveFetch(id, tag, r) {
-    const send = (op, ...f) => this.os?.winix.send(id, frame(tag, op, ...f));
+}
+
+/// Routes the /dev/winix channels of a booted linux() instance. HTTP requests from guest programs (curl, apt) are
+/// made with `fetch`; winix://path URLs resolve against baseUrl, where the package repository (pkgs/) is served.
+/// Other frames go to onFrame(channelId, tag, op, reader).
+export function attachChannels(os, { fetch: fetchFn = (...a) => fetch(...a), baseUrl = document.baseURI, onFrame = () => {} } = {}) {
+  const channels = new Map(); // id -> Framer
+  const serveFetch = async (id, tag, r) => {
+    const send = (op, ...f) => os.winix.send(id, frame(tag, op, ...f));
     try {
       r.u8(); // flags (redirects are always followed)
       const method = r.str(), url = r.str(), headerText = r.str(), body = r.bytes();
@@ -211,7 +205,8 @@ class Machine {
         const i = line.indexOf(':');
         if (i > 0) headers.append(line.slice(0, i).trim(), line.slice(i + 1).trim());
       }
-      const res = await this.fetch(url, {
+      const target = url.startsWith('winix://') ? new URL(url.slice('winix://'.length), baseUrl).href : url;
+      const res = await fetchFn(target, {
         method, headers, body: method === 'GET' || method === 'HEAD' ? undefined : body.slice(), redirect: 'follow',
       });
       let hs = '';
@@ -221,16 +216,25 @@ class Machine {
         const reader = res.body.getReader();
         for (;;) {
           const { done, value } = await reader.read();
-          if (done || this.dead) break;
+          if (done) break;
+          if (!channels.has(id)) return reader.cancel(); // the guest closed the channel
           send(RP.BODY, value);
         }
       }
       send(RP.END);
     } catch (e) {
       send(RP.ERR, 0, `fetch failed: ${e.message || e} (network error, or the server does not allow CORS; ` +
-        'pass a proxying fetch to Winix.boot)');
+        'pass a proxying fetch, such as proxyFetch())');
     }
-  }
+  };
+  os.winix.set_handler({
+    data: (id, bytes) => {
+      let c = channels.get(id);
+      if (!c) channels.set(id, (c = new Framer((tag, op, r) => (op === OP.FETCH ? serveFetch(id, tag, r) : onFrame(id, tag, op, r)))));
+      c.push(bytes);
+    },
+    close: (id) => channels.delete(id),
+  });
 }
 
 /// A fetch for Winix.boot({ fetch }) that sends cross-origin requests through a proxy endpoint (such as

@@ -1,3 +1,5 @@
 *.sh text eol=lf
 *.mjs text eol=lf
 *.patch text eol=lf
+guest/** text eol=lf
+packages/** text eol=lf

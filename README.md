@@ -30,6 +30,19 @@ so the browser's CORS rules apply. `proxyFetch()` sends cross-origin requests th
 server instead; in production, point it at your own proxy (`proxyFetch('https://proxy.example/?url=')`) or pass any
 `fetch`-compatible function.
 
+## Packages
+
+`apt` (also `apt-get`, and `apk add`) installs packages from the winix repository: wasm builds made from the
+recipes in `packages/`, not Debian packages. `apt-get install -y sqlite` downloads `pkgs/sqlite_<ver>.tar.gz` from
+next to the page (the guest's `winix://` URLs), checks its SHA-256 against `pkgs/index.txt`, and unpacks it at `/`.
+Archives are versioned by name, so browsers can cache them indefinitely. Unknown packages fail the way apt does
+(`E: Unable to locate package X`, exit 100). Point `WINIX_REPO` at another URL to use a different repository.
+
+Available now: `sqlite` (sqlite3). Programs that use `setjmp`/`longjmp` (Lua, for one) trap with the current
+toolchain, which has no wasm exception-handling support yet.
+
+To add a package, write `packages/<name>.sh` (see `sqlite.sh`) and run `scripts/build.sh packages <name>`.
+
 ## Run it
 
 The page must be cross-origin isolated (COOP/COEP) for `SharedArrayBuffer`; `scripts/serve.mjs` sets the headers.

@@ -31,7 +31,9 @@
 <div id="wrap"><div id="terminal"></div></div>
 <script src="xterm.js"></script>
 <script src="linux.js"></script>
-<script>
+<script type="module">
+  import { attachChannels, proxyFetch } from './winix.js';
+
   const cmdline = 'maxcpus=1 nohz_full=0,2-63 rcu_nocbs=0,2-63 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0 quiet';
   const variant = 'wasm32_nommu';
   const css = getComputedStyle(document.documentElement);
@@ -77,6 +79,7 @@
           status.textContent = `ready · ${Math.round(performance.now() - t0)} ms`;
         }
       });
+      attachChannels(os, { fetch: proxyFetch() }); // curl and apt
       term.onData((data) => os.key_input(data));
       term.focus();
     } catch (e) {

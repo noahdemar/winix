@@ -1,5 +1,5 @@
 #!/bin/bash
-# Cross-build the guest side of the host channel (winixd, curl) and stage them, plus /init, in the overlay.
+# Cross-build the guest side of the host channel (winixd, curl) and stage them, plus /init and apt, in the overlay.
 # Called by build.sh (needs its env: LW_WORKSPACE LW_VARIANT BUILD_ROOT SRC REPO OVERLAY).
 set -euo pipefail
 
@@ -22,4 +22,7 @@ mkdir -p "$OBJ" "$OVERLAY/sbin" "$OVERLAY/usr/bin"
 build winixd "$OVERLAY/sbin/winixd"
 build curl "$OVERLAY/usr/bin/curl"
 install -m 755 "$G/init" "$OVERLAY/init"
+install -m 755 "$G/apt" "$OVERLAY/usr/bin/apt"
+ln -sf apt "$OVERLAY/usr/bin/apt-get"
+ln -sf apt "$OVERLAY/usr/bin/apk"
 ls -l "$OVERLAY/sbin/winixd" "$OVERLAY/usr/bin/curl"
