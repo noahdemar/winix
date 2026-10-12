@@ -5,6 +5,7 @@
 #   kernel   apply patches, rebuild kernel only -> dist/vmlinux-*.wasm
 #   busybox  apply patches/config, rebuild busybox + initramfs (+ overlay) -> dist/initramfs-*.cpio.gz
 #   quickjs  rebuild qjs, repack initramfs with the overlay
+#   guest    rebuild winixd + curl (guest/), repack initramfs with the overlay
 # Builds on the native Linux fs (~/winix-build) because /mnt/c is slow and paths must not contain spaces.
 set -euo pipefail
 
@@ -92,10 +93,11 @@ case "$TARGET" in
   kernel)
     ./linux-wasm.sh build-kernel
     ;;
-  busybox|quickjs)
+  busybox|quickjs|guest)
     [ "$TARGET" = busybox ] && { apply_busybox_config; rm -rf "$I/busybox-$LW_VARIANT"; ./linux-wasm.sh build-busybox; }
     ./linux-wasm.sh build-initramfs
     if [ "$TARGET" = quickjs ] || [ ! -x "$OVERLAY/usr/bin/qjs" ]; then "$REPO/scripts/build-quickjs.sh"; fi
+    "$REPO/scripts/build-guest.sh"
     pack_overlay
     ;;
   all)
@@ -107,6 +109,7 @@ case "$TARGET" in
     rm -rf "$I/busybox-$LW_VARIANT" # drop stale applet symlinks
     ./linux-wasm.sh build-os
     "$REPO/scripts/build-quickjs.sh"
+    "$REPO/scripts/build-guest.sh"
     pack_overlay
     # runtime/ (with patches/runtime applied) and src/ are copied by copy-src.sh below
     ;;
@@ -115,6 +118,6 @@ esac
 
 # runtime/index.html fetches variant-suffixed names
 case "$TARGET" in kernel|all) cp "$I/kernel-$LW_VARIANT/vmlinux.wasm" "$D/vmlinux-$LW_VARIANT.wasm" ;; esac
-case "$TARGET" in busybox|quickjs|all) cp "$I/initramfs-$LW_VARIANT/initramfs.cpio.gz" "$D/initramfs-$LW_VARIANT.cpio.gz" ;; esac
+case "$TARGET" in busybox|quickjs|guest|all) cp "$I/initramfs-$LW_VARIANT/initramfs.cpio.gz" "$D/initramfs-$LW_VARIANT.cpio.gz" ;; esac
 ls -l "$D"
 "$REPO/scripts/copy-src.sh" "$D"

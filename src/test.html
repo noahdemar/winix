@@ -217,6 +217,20 @@ echo "it's"`;
       eq(back.every((v, j) => v === data[j]), true, 'bytes ' + i);
     }
   }],
+  ['33 curl GET', async () => {
+    const r = await w.exec(`curl -s ${location.origin}/machine.html`);
+    eq(r.exitCode, 0, 'exit, stderr ' + r.stderr);
+    eq(r.stdout.includes('linux.js'), true, 'body ' + r.stdout.slice(0, 80));
+  }],
+  ['34 curl -o -w, -f on 404', async () => {
+    const r = await w.exec(`curl -s -o page.html -w '%{http_code}' ${location.origin}/machine.html && grep -q linux.js page.html && echo ' ok'`);
+    eq(r.stdout, '200 ok\n');
+    eq((await w.exec(`curl -sf ${location.origin}/nope`)).exitCode, 22);
+  }],
+  ['35 curl -i and POST body', async () => {
+    const r = await w.exec(`curl -si -X POST -d a=1 ${location.origin}/machine.html | head -n 1`);
+    eq(/^HTTP\/1\.1 \d{3} /.test(r.stdout), true, 'status line ' + JSON.stringify(r.stdout));
+  }],
 ];
 
 for (const [name, fn] of cases) {
@@ -241,7 +255,6 @@ try {
   results.timings.throughputOk = back.length === big.length && back.every((v, i) => v === big[i]);
 } catch (e) { results.timings.error = String(e.message || e); }
 
-results.stats = w.stats();
 w.dispose();
 window.__done = true;
 </script>

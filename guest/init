@@ -1,0 +1,8 @@
+#!/bin/sh
+# Replaces upstream's /init (later cpio entries win): same mounts, plus winixd for the host API.
+
+mount -t proc none /proc
+mount -t sysfs none /sys
+/sbin/winixd &
+
+exec /sbin/init -s

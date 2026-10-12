@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>winix terminal</title>
+<link rel="stylesheet" href="xterm.css">
+<style>
+  :root {
+    --bg: #fbfbfa; --fg: #1c1c1a; --muted: #8a8a85; --line: #e6e5e1;
+    --term-bg: #161615; --term-fg: #e8e7e3;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121211; --fg: #e8e7e3; --muted: #7d7c77; --line: #262624; --term-bg: #1a1a19; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
+  body { font: 13px/1.5 var(--mono); display: flex; flex-direction: column; }
+  header { display: flex; gap: 16px; align-items: baseline; max-width: 900px; width: 100%; margin: 0 auto; padding: 20px 16px 12px; }
+  header a { color: inherit; text-decoration: none; font-weight: 600; }
+  header span { color: var(--muted); }
+  #wrap { flex: 1; min-height: 0; max-width: 900px; width: 100%; margin: 0 auto 16px; padding: 0 16px; }
+  #terminal { height: 100%; background: var(--term-bg); border: 1px solid var(--line); border-radius: 10px; padding: 12px 6px 12px 14px; overflow: hidden; }
+  .xterm .xterm-viewport { background: transparent !important; scrollbar-width: thin; scrollbar-color: #3a3a38 transparent; }
+</style>
+<header>
+  <a href="./">winix</a>
+  <span id="status">booting…</span>
+</header>
+<div id="wrap"><div id="terminal"></div></div>
+<script src="xterm.js"></script>
+<script src="linux.js"></script>
+<script>
+  const cmdline = 'maxcpus=1 nohz_full=0,2-63 rcu_nocbs=0,2-63 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0 quiet';
+  const variant = 'wasm32_nommu';
+  const css = getComputedStyle(document.documentElement);
+  const term = new Terminal({
+    fontFamily: css.getPropertyValue('--mono'),
+    fontSize: 13.5,
+    cursorBlink: true,
+    theme: { background: css.getPropertyValue('--term-bg').trim(), foreground: css.getPropertyValue('--term-fg').trim(),
+      cursor: '#7cc59b', selectionBackground: '#3a4a40' },
+  });
+  term.open(document.getElementById('terminal'));
+
+  // Fit rows/columns to the panel (xterm's fit addon, inlined: cell size comes from the renderer).
+  const fit = () => {
+    const cell = term._core?._renderService?.dimensions?.css?.cell;
+    const el = document.getElementById('terminal');
+    if (!cell?.width) return;
+    const cs = getComputedStyle(el);
+    const w = el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - 14; // scrollbar
+    const h = el.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+    term.resize(Math.max(20, Math.floor(w / cell.width)), Math.max(5, Math.floor(h / cell.height)));
+  };
+  fit();
+  addEventListener('resize', fit);
+
+  const status = document.getElementById('status');
+  const log = (text) => term.write(('\x1b[2m' + text + '\x1b[0m\n').replaceAll('\n', '\r\n'));
+  (async () => {
+    try {
+      if (!crossOriginIsolated) throw new Error('page is not cross-origin isolated (COOP/COEP headers missing)');
+      const [vmlinux, initrd] = await Promise.all([
+        WebAssembly.compileStreaming(fetch(`vmlinux-${variant}.wasm`)),
+        fetch(`initramfs-${variant}.cpio.gz`).then((r) => r.arrayBuffer()),
+      ]);
+      const t0 = performance.now();
+      let os, ready = false;
+      os = await linux('linux-worker.js', variant, vmlinux, cmdline, initrd, () => {}, (data) => {
+        term.write(data);
+        // At the first prompt, tell the tty our size (the host cannot set it), then clear the screen.
+        if (!ready && /# $/.test(data)) {
+          ready = true;
+          os.key_input(`stty cols ${term.cols} rows ${term.rows}; clear\n`);
+          status.textContent = `ready · ${Math.round(performance.now() - t0)} ms`;
+        }
+      });
+      term.onData((data) => os.key_input(data));
+      term.focus();
+    } catch (e) {
+      status.textContent = 'failed';
+      log('boot failed: ' + e.message);
+    }
+  })();
+</script>
+</html>

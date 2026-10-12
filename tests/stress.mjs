@@ -1,13 +1,14 @@
 // Stress: N fresh page loads of test.html (fresh machine each), classify pass / panic / fail.
-// Usage: node tests/stress.mjs [N=30] [out=dist/stress.json] [url=http://127.0.0.1:8000/test.html]
+// Usage: node tests/stress.mjs [N=30] [out=build/stress.json] [url=http://127.0.0.1:8000/test.html]
 // Env: PW_CHANNEL (e.g. msedge), PLAYWRIGHT_CORE (path to playwright-core).
 import { createRequire } from "node:module";
 import fs from "node:fs";
+fs.mkdirSync("build", { recursive: true });
 
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_CORE ?? "playwright-core");
 const N = Number(process.argv[2] ?? 30);
-const out = process.argv[3] ?? "dist/stress.json";
+const out = process.argv[3] ?? "build/stress.json";
 const url = process.argv[4] ?? "http://127.0.0.1:8000/test.html";
 const perRunMs = 180000;
 

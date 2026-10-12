@@ -1,0 +1,99 @@
+diff --git a/arch/wasm/kernel/Makefile b/arch/wasm/kernel/Makefile
+index 787a7c00e..7f8d1e13b 100644
+--- a/arch/wasm/kernel/Makefile
++++ b/arch/wasm/kernel/Makefile
+@@ -19,6 +19,7 @@ obj-y += sys_wasm.o
+ obj-y += syscall_table.o
+ obj-y += time.o
+ obj-y += traps.o
++obj-y += winix.o
+ 
+ ifndef CONFIG_64BIT
+ obj-y += sys_wasm32.o
+diff --git a/arch/wasm/kernel/winix.c b/arch/wasm/kernel/winix.c
+new file mode 100644
+index 000000000..69d40d827
+--- /dev/null
++++ b/arch/wasm/kernel/winix.c
+@@ -0,0 +1,81 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * /dev/winix: binary byte channels between guest programs and the Wasm host page.
++ *
++ * Every open() is its own channel. write() hands the bytes to the host as they are; read() asks the host for queued
++ * bytes. The host cannot interrupt the kernel, so a reader polls, sleeping briefly between empty polls (the host side
++ * answers an empty poll from a shared flag, without a round trip). The host closing a channel reads as EOF.
++ */
++
++#include <linux/atomic.h>
++#include <linux/delay.h>
++#include <linux/fs.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/sched/signal.h>
++
++extern ssize_t wasm_driver_winix_put(u32 id, const u8 *buf, size_t count);
++extern ssize_t wasm_driver_winix_get(u32 id, u8 *buf, size_t count);
++extern void wasm_driver_winix_close(u32 id);
++
++static atomic_t winix_next_id = ATOMIC_INIT(0);
++
++static u32 winix_id(struct file *file)
++{
++	return (u32)(uintptr_t)file->private_data;
++}
++
++static int winix_open(struct inode *inode, struct file *file)
++{
++	file->private_data = (void *)(uintptr_t)atomic_inc_return(&winix_next_id);
++	return stream_open(inode, file);
++}
++
++/* NOMMU: user and kernel share one address space, so user buffers go to the host directly. */
++static ssize_t winix_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
++{
++	ssize_t n;
++
++	if (!count)
++		return 0;
++	for (;;) {
++		n = wasm_driver_winix_get(winix_id(file), (u8 __force *)buf, count);
++		if (n > 0)
++			return n;
++		if (n < 0)
++			return 0;
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++		if (signal_pending(current))
++			return -ERESTARTSYS;
++		usleep_range(200, 500);
++	}
++}
++
++static ssize_t winix_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
++{
++	return wasm_driver_winix_put(winix_id(file), (const u8 __force *)buf, count);
++}
++
++static int winix_release(struct inode *inode, struct file *file)
++{
++	wasm_driver_winix_close(winix_id(file));
++	return 0;
++}
++
++static const struct file_operations winix_fops = {
++	.owner = THIS_MODULE,
++	.open = winix_open,
++	.read = winix_read,
++	.write = winix_write,
++	.release = winix_release,
++};
++
++static struct miscdevice winix_dev = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "winix",
++	.fops = &winix_fops,
++	.mode = 0666,
++};
++
++module_misc_device(winix_dev);

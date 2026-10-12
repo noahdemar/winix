@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>winix</title>
+<meta name="description" content="A real Linux kernel running in your browser, as WebAssembly.">
+<style>
+  :root {
+    --bg: #fbfbfa; --fg: #1c1c1a; --muted: #8a8a85; --line: #e6e5e1; --err: #b4442f; --accent: #2f6f4f;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121211; --fg: #e8e7e3; --muted: #7d7c77; --line: #262624; --err: #e07a62; --accent: #7cc59b; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); }
+  body { font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 56px 16px 40px; min-height: 100vh; display: flex; flex-direction: column; }
+  h1 { font: 600 20px/1 var(--mono); letter-spacing: -0.02em; margin: 0; }
+  header p { margin: 10px 0 0; color: var(--muted); }
+  #status { font: 13px var(--mono); color: var(--muted); margin-top: 28px; }
+  #status b { color: var(--accent); font-weight: 500; }
+  #log { flex: 1; margin-top: 12px; font: 13.5px/1.6 var(--mono); }
+  .entry { padding: 14px 0; border-top: 1px solid var(--line); }
+  .cmd { white-space: pre-wrap; word-break: break-word; }
+  .cmd::before { content: "$ "; color: var(--muted); }
+  pre { margin: 6px 0 0; white-space: pre-wrap; word-break: break-word; font: inherit; }
+  .stderr { color: var(--err); }
+  .meta { margin-top: 6px; font-size: 12px; color: var(--muted); }
+  form { position: sticky; bottom: 0; background: var(--bg); padding: 12px 0 16px; border-top: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
+  form span { font: 14px var(--mono); color: var(--muted); }
+  input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: inherit; font: 14px var(--mono); padding: 6px 0; }
+  input:disabled { opacity: .5; }
+  nav { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 18px; }
+  nav button { font: 12.5px var(--mono); color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; cursor: pointer; }
+  nav button:hover { border-color: var(--muted); }
+  footer { margin-top: 20px; font-size: 13px; color: var(--muted); }
+  footer a { color: inherit; }
+</style>
+<main>
+  <header>
+    <h1>winix</h1>
+    <p>A real Linux kernel running in your browser as WebAssembly. No VM, no server. BusyBox, QuickJS and curl included.</p>
+  </header>
+  <nav id="examples"></nav>
+  <div id="status">booting…</div>
+  <div id="log"></div>
+  <form id="prompt" autocomplete="off">
+    <span>$</span>
+    <input id="cmd" placeholder="type a command" disabled spellcheck="false" autocapitalize="off" aria-label="command">
+  </form>
+  <footer>Each command runs in a fresh <code>sh</code>; files persist. Full-screen programs (vi, top) need the <a href="terminal.html">terminal</a>.</footer>
+</main>
+<script type="module">
+import { Winix, proxyFetch } from './winix.js';
+
+const $ = (id) => document.getElementById(id);
+const examples = [
+  'uname -a',
+  "echo 'console.log([1, 2, 3].map(x => x ** 2), 2n ** 64n)' > a.js && qjs a.js",
+  'ls /bin | wc -l',
+  'curl -sI https://example.com | head -n 5',
+  'seq 1 100000 | awk \'{ s += $1 } END { print s }\'',
+];
+const history = [];
+let hpos = 0;
+
+const el = (tag, cls, text) => Object.assign(document.createElement(tag), { className: cls, textContent: text });
+
+const t0 = performance.now();
+const w = await Winix.boot({ fetch: proxyFetch() }).catch((e) => {
+  $('status').textContent = 'boot failed: ' + e.message;
+  throw e;
+});
+$('status').innerHTML = `<b>ready</b> · booted in ${Math.round(performance.now() - t0)} ms`;
+$('cmd').disabled = false;
+$('cmd').focus();
+
+async function run(cmd) {
+  if (!cmd.trim()) return;
+  history.push(cmd);
+  hpos = history.length;
+  const entry = el('div', 'entry');
+  entry.append(el('div', 'cmd', cmd));
+  $('log').append(entry);
+  $('cmd').disabled = true;
+  try {
+    const r = await w.exec(cmd, { timeoutMs: 30000 });
+    if (r.stdout) entry.append(el('pre', 'stdout', r.stdout.replace(/\n$/, '')));
+    if (r.stderr) entry.append(el('pre', 'stderr', r.stderr.replace(/\n$/, '')));
+    const meta = [`${Math.round(r.durationMs)} ms`];
+    if (r.exitCode) meta.unshift(r.timedOut ? 'timed out' : `exit ${r.exitCode}`);
+    if (r.truncated) meta.push('output truncated');
+    entry.append(el('div', 'meta', meta.join(' · ')));
+  } catch (e) {
+    entry.append(el('pre', 'stderr', e.message));
+  }
+  $('cmd').disabled = false;
+  $('cmd').focus();
+  entry.scrollIntoView({ block: 'nearest' });
+}
+
+for (const ex of examples) {
+  const b = el('button', '', ex.length > 34 ? ex.slice(0, 32) + '…' : ex);
+  b.type = 'button';
+  b.title = ex;
+  b.onclick = () => !$('cmd').disabled && run(ex);
+  $('examples').append(b);
+}
+$('prompt').onsubmit = (e) => {
+  e.preventDefault();
+  const cmd = $('cmd').value;
+  $('cmd').value = '';
+  run(cmd);
+};
+$('cmd').onkeydown = (e) => {
+  if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+  e.preventDefault();
+  hpos = Math.max(0, Math.min(history.length, hpos + (e.key === 'ArrowUp' ? -1 : 1)));
+  $('cmd').value = history[hpos] ?? '';
+};
+</script>
+</html>

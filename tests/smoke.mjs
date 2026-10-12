@@ -2,6 +2,7 @@
 // Env: PW_CHANNEL (e.g. msedge), PLAYWRIGHT_CORE (path to playwright-core).
 import { createRequire } from "node:module";
 import fs from "node:fs";
+fs.mkdirSync("build", { recursive: true });
 
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_CORE ?? "playwright-core");
@@ -16,7 +17,7 @@ const results = await page.evaluate(() => window.__results);
 await browser.close();
 
 if (results.bootError) { console.log("BOOT FAILED:", results.bootError); process.exit(1); }
-fs.writeFileSync("dist/smoke-results.json", JSON.stringify(results, null, 2));
+fs.writeFileSync("build/smoke-results.json", JSON.stringify(results, null, 2));
 for (const c of results.cases) console.log(`${c.pass ? "PASS" : "FAIL"}  ${c.name}  (${Math.round(c.ms)} ms)${c.pass ? "" : "\n      " + c.error}`);
 console.log("timings:", results.timings);
 process.exit(results.cases.every((c) => c.pass) ? 0 : 1);

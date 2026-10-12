@@ -1,24 +1,34 @@
 # winix
 
 A real Linux kernel ([linux-wasm](https://github.com/joelseverin/linux-wasm), no-MMU `arch/wasm`) plus a wasm
-userland (BusyBox, QuickJS) running in the browser with no CPU emulation, behind a small JS API so agents can run
-shell commands and scripts.
+userland (BusyBox, QuickJS, curl) running in the browser with no CPU emulation, behind a small JS API so agents can
+run shell commands and scripts.
+
+The API talks to a guest daemon (`winixd`) over `/dev/winix`, a binary channel device added to the kernel, so
+there is no terminal scraping: `exec` costs about 40 ms, a 200 KB file transfer about 12 ms, and boot about 0.5 s.
 
 ```js
-import { Winix } from './winix.js';
+import { Winix, proxyFetch } from './winix.js';
 
-const w = await Winix.boot();                        // ~1.3 s cold boot
+const w = await Winix.boot({ fetch: proxyFetch() }); // ~0.5 s; fetch is used for guest curl requests
 const r = await w.exec('echo hi; ls /bin | wc -l', { cwd: '/work', env: { FOO: '1' }, timeoutMs: 60000 });
 // r = { stdout, stderr, exitCode, timedOut, truncated, durationMs }
 await w.writeFile('/work/a.js', 'console.log(6 * 7)');
 await w.exec('qjs /work/a.js');                      // QuickJS: ES2023, modules, std/os
+await w.exec('curl -s https://example.com');         // HTTP(S) via the page's fetch
 const bytes = await w.readFile('/work/a.js');        // Uint8Array, or { encoding: 'utf8' } for a string
 await w.reset();                                     // fresh machine
 w.dispose();
 ```
 
-The filesystem persists between `exec` calls; shell variables do not (each call is a fresh `sh`). Calls are queued
-and run one at a time. A timed-out command is killed and the machine is rebuilt.
+The filesystem persists between `exec` calls; shell variables do not (each call is a fresh `sh -c`). Calls are
+queued and run one at a time. A timed-out command's process group is killed; the machine is only rebuilt if
+`winixd` itself stops answering.
+
+The guest has no sockets. `curl` (common flags: `-sSfLiIoOXHdAw`) asks the page to make the request with `fetch`,
+so the browser's CORS rules apply. `proxyFetch()` sends cross-origin requests through `/__proxy?url=` on the dev
+server instead; in production, point it at your own proxy (`proxyFetch('https://proxy.example/?url=')`) or pass any
+`fetch`-compatible function.
 
 ## Run it
 
@@ -28,8 +38,11 @@ The page must be cross-origin isolated (COOP/COEP) for `SharedArrayBuffer`; `scr
 node scripts/serve.mjs dist 8000
 ```
 
-- http://127.0.0.1:8000/ is an interactive BusyBox terminal.
-- http://127.0.0.1:8000/test.html runs the API test suite in the page.
+- http://127.0.0.1:8000/ is a command box on top of the API.
+- http://127.0.0.1:8000/terminal.html is a full terminal (xterm.js; for vi, top, and so on).
+- http://127.0.0.1:8000/test.html runs the API test suite in the page; bench.html prints latency numbers.
+
+The server listens on localhost only, because `/__proxy` will fetch any URL.
 
 ## Tests
 
@@ -41,10 +54,11 @@ node tests/smoke.mjs
 ```
 
 ```bash
-node tests/stress.mjs 30 dist/stress.json
+node tests/stress.mjs 30 build/stress.json
 ```
 
 `stress.mjs` runs 30 fresh boots of the suite and classifies each as pass / panic / fail / hang.
+`node tests/bench.mjs` prints boot, exec, process-start and file-transfer times.
 
 ## Build
 
@@ -52,16 +66,20 @@ node tests/stress.mjs 30 dist/stress.json
 LLVM and takes a long time.
 
 ```bash
-scripts/build.sh            # all | kernel | busybox | quickjs
+scripts/build.sh            # all | kernel | busybox | quickjs | guest
 ```
 
 Changing only `src/` or `patches/runtime/` needs no rebuild: `scripts/copy-src.sh` refreshes `dist/`.
 
 Our changes on top of upstream live in `patches/`:
 
-- `kernel/`: a 256 KB user stack, and max page order 14 (this fixed boot-time panics).
+- `kernel/`: a 256 KB user stack, max page order 14 (this fixed boot-time panics), and the `/dev/winix` device.
 - `busybox/`: vfork-safe clone callbacks, plus the applet config.
 - `quickjs/`: a port that runs without worker threads and with a small stack.
-- `runtime/`: console output is sequenced across Web Workers and decoded as one byte stream.
+- `runtime/`: console output is sequenced across Web Workers and decoded as one byte stream; host side of
+  `/dev/winix`.
+
+`guest/` holds `winixd`, `curl` and the `/init` that starts `winixd`; `guest/winix-proto.h` defines the frame
+format shared with `src/winix.js`.
 
 See `docs/runtime-notes.md` for how the runtime works.
