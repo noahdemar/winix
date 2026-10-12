@@ -84,7 +84,7 @@
 +#endif
 --- a/blink/jit.h
 +++ b/blink/jit.h
-@@ -221,6 +221,15 @@
+@@ -221,6 +221,17 @@
    _Alignas(kSemSize) _Atomic(unsigned) pagegen;
  };
  
@@ -95,6 +95,8 @@
 +#define kWasmEnder ((uintptr_t)1)
 +bool AppendJitStashCheck(struct JitBlock *);
 +uintptr_t WinixJitProbe(i64, bool *);
++bool AppendJitGuestBegin(struct JitBlock *, u64, i64, u64);
++bool AppendJitGuestEnd(struct JitBlock *);
 +#endif
 +
  extern const u8 kJitRes[2];
@@ -115,7 +117,7 @@
 +#endif
 --- a/blink/jitwasm.c
 +++ b/blink/jitwasm.c
-@@ -0,0 +1,1316 @@
+@@ -0,0 +1,1479 @@
 +/* Blink JIT backend for WebAssembly hosts (winix).
 + *
 + * Blink's JIT builds "paths": it records hot x86 code as a sequence of calls to
@@ -174,12 +176,14 @@
 +  kIrSkipNz,   // skip the next jump if reg != 0
 +  kIrSkipCmp,  // skip the next jump if cond(a - b)
 +  kIrStash,    // if (m->stashaddr) CommitStash(m)
++  kIrGuestBegin,  // metadata: x = rde, y = disp, z = uimm0 of one guest instruction
++  kIrGuestEnd,    // metadata: the instruction's span ends here
 +};
 +
 +struct Ir {
 +  u8 op, a, b, wide;  // wide: 64-bit compare
 +  u32 cond;
-+  u64 x;
++  u64 x, y, z;
 +};
 +
 +#define kIrMax (kJitBlockSize / sizeof(struct Ir))
@@ -198,9 +202,11 @@
 +static bool g_noinline;      // WINIX_JIT_NOINLINE
 +static bool g_nomemfast;     // WINIX_JIT_NOMEMFAST
 +static bool g_nostackfast;   // WINIX_JIT_NOSTACKFAST
++static bool g_notrace;       // experimental semantic tier: WINIX_JIT_TRACE enables, WINIX_JIT_NOTRACE overrides
 +static int g_batch_max = 16;  // WINIX_JIT_BATCH: paths per module
 +static struct {
 +  long started, abandoned, paths, failed, ops, bytes, batches;
++  long trace_ops, trace_regions, flag_elided;  // emitted code: guest instructions, regions, elided flag sets
 +  double ms, wasm_ms;
 +} g_stats;
 +
@@ -211,12 +217,13 @@
 +}
 +
 +static void PrintStats(void) {
-+  char b[192];
++  char b[256];
 +  snprintf(b, sizeof(b),
 +           "[blink wasm jit] started=%ld abandoned=%ld paths=%ld failed=%ld ops=%ld modules=%ld bytes=%ld "
-+           "compile=%.0fms (wasm %.0fms)\n",
++           "compile=%.0fms (wasm %.0fms) trace_ops=%ld trace_regions=%ld flag_elided=%ld\n",
 +           g_stats.started, g_stats.abandoned, g_stats.paths, g_stats.failed, g_stats.ops, g_stats.batches,
-+           g_stats.bytes, g_stats.ms, g_stats.wasm_ms);
++           g_stats.bytes, g_stats.ms, g_stats.wasm_ms, g_stats.trace_ops, g_stats.trace_regions,
++           g_stats.flag_elided);
 +  write(2, b, strlen(b));
 +}
 +
@@ -355,6 +362,7 @@
 +  g_noinline = !!getenv("WINIX_JIT_NOINLINE");
 +  g_nomemfast = !!getenv("WINIX_JIT_NOMEMFAST");
 +  g_nostackfast = !!getenv("WINIX_JIT_NOSTACKFAST");
++  g_notrace = !getenv("WINIX_JIT_TRACE") || !!getenv("WINIX_JIT_NOTRACE");
 +  if (getenv("WINIX_JIT_BATCH")) g_batch_max = atoi(getenv("WINIX_JIT_BATCH"));
 +  if (g_batch_max < 1 || g_batch_max > 26) g_batch_max = 16;
 +  static bool stats;
@@ -480,6 +488,15 @@
 +}
 +bool AppendJitStashCheck(struct JitBlock *jb) {
 +  return Emit(jb, (struct Ir){.op = kIrStash});
++}
++
++// Guest instruction span markers, recorded by GeneralDispatch around one instruction's path code.
++bool AppendJitGuestBegin(struct JitBlock *jb, u64 rde, i64 disp, u64 uimm0) {
++  return Emit(jb, (struct Ir){.op = kIrGuestBegin, .x = rde, .y = (u64)disp, .z = uimm0});
++}
++
++bool AppendJitGuestEnd(struct JitBlock *jb) {
++  return Emit(jb, (struct Ir){.op = kIrGuestEnd});
 +}
 +
 +bool RecordJitJump(struct JitBlock *jb, u64 virt, int addend) {
@@ -1048,10 +1065,136 @@
 +
 +static bool EmitCall(struct Buf *b, uintptr_t fn);
 +
++#define T_ADDR   26  // virtual address of a memory operand
++#define T_TARGET 27  // the code address read from it
++#define T_SP     28  // stack pointer below a call's return address
++
++// Leaves the branch to the enclosing $slow block when the 8 bytes at virtual
++// register vreg (within one page) are not a TLB hit with the permissions
++// `need`; the checks mirror EmitReserveFast. On a hit LOCAL(32) holds the host
++// address. Uses no blocks of its own, so the br depth is the one $slow.
++static void EmitTlb8(struct Buf *b, int vreg, u64 need, bool writing) {
++  const u32 tlb = offsetof(struct Machine, tlb);
++  B1(b, 0x20), BU(b, 0), BMem(b, 0x2d, 0, offsetof(struct Machine, invalidated));
++  B1(b, 0x20), BU(b, 0), BMem(b, 0x2d, 0, offsetof(struct Machine, metal));
++  B1(b, 0x72);  // i32.or
++  GetReg(b, vreg), I64Const(b, 4095), B1(b, 0x83), I64Const(b, 4088), B1(b, 0x56);
++  B1(b, 0x72);
++  // slot = m + ((v >> 12) & (TLB size - 1)) * 16
++  B1(b, 0x20), BU(b, 0);
++  GetReg(b, vreg), I64Const(b, 12), B1(b, 0x88), B1(b, 0xa7);
++  B1(b, 0x41), BS(b, ARRAYLEN(((struct Machine *)0)->tlb) - 1), B1(b, 0x71);
++  B1(b, 0x41), BS(b, 4), B1(b, 0x74), B1(b, 0x6a);
++  B1(b, 0x21), BU(b, LOCAL(32));
++  // slot->page != (v & -4096)
++  B1(b, 0x20), BU(b, LOCAL(32)), BMem(b, 0x29, 3, tlb);
++  GetReg(b, vreg), I64Const(b, -4096), B1(b, 0x83), B1(b, 0x52);
++  B1(b, 0x72);
++  // entry lacks the permissions needed
++  B1(b, 0x20), BU(b, LOCAL(32)), BMem(b, 0x29, 3, tlb + 8);
++  SetRegFromStack(b, T_ENTRY);
++  GetReg(b, T_ENTRY), I64Const(b, need), B1(b, 0x83), I64Const(b, need), B1(b, 0x52);
++  B1(b, 0x72);
++  if (writing) {  // writable and executable (no XD): not a fast write
++    GetReg(b, T_ENTRY), I64Const(b, PAGE_U | PAGE_RW | PAGE_XD), B1(b, 0x83);
++    I64Const(b, PAGE_U | PAGE_RW), B1(b, 0x51);
++    B1(b, 0x72);
++  }
++  B1(b, 0x0d), BU(b, 0);  // br_if $slow
++  // host = (entry & PAGE_TA) + (v & 4095)
++  GetReg(b, T_ENTRY), B1(b, 0xa7), B1(b, 0x41), BS(b, (i32)0xfffff000), B1(b, 0x71);
++  GetReg(b, vreg), B1(b, 0xa7), B1(b, 0x41), BS(b, 4095), B1(b, 0x71), B1(b, 0x6a);
++  B1(b, 0x21), BU(b, LOCAL(32));
++}
++
++// T_ADDR += (i64)(m-field at off) << shift
++static void EmitAddField(struct Buf *b, u32 off, int shift) {
++  GetReg(b, T_ADDR);
++  B1(b, 0x20), BU(b, 0), BMem(b, 0x29, 3, off);
++  if (shift) I64Const(b, shift), B1(b, 0x86);  // i64.shl
++  B1(b, 0x7c), SetRegFromStack(b, T_ADDR);     // i64.add
++}
++
++// Memory operands of `ff /2` and `ff /4` in long mode with no address-size
++// or operand-size prefix, and a segment override the table holds.
++static bool IsIndirectMemory(u64 rde) {
++  if (Osz(rde) || IsModrmRegister(rde) || Eamode(rde) != XED_MODE_LONG) return false;
++  if (Sego(rde) > 6) return false;
++  return ModrmReg(rde) == 2 || ModrmReg(rde) == 4;
++}
++
++// block $done; block $slow; <fast path>; end $slow -- the caller emits the
++// slow call and the final `end $done`. The fast path computes the operand's
++// address exactly as LoadEffectiveAddress does for this rde, reads the target
++// through the TLB, and for call pushes the return address; the guest state is
++// only written after every check has passed, so a miss runs the real op.
++// The target is not cached across executions: it is read every time.
++static void EmitIndirectMemoryFast(struct Buf *b, u64 rde) {
++  const u32 gp = offsetof(struct Machine, weg);
++  bool ss = false;
++  B1(b, 0x02), B1(b, 0x40);  // block $done
++  B1(b, 0x02), B1(b, 0x40);  // block $slow
++  GetReg(b, kJitArg2), SetRegFromStack(b, T_ADDR);  // disp
++  if (!SibExists(rde)) {
++    if (IsRipRelative(rde)) {
++      EmitAddField(b, offsetof(struct Machine, ip), 0);
++    } else {
++      EmitAddField(b, gp + 8 * RexbRm(rde), 0);
++      if (RexbRm(rde) == 4 || RexbRm(rde) == 5) ss = true;
++    }
++  } else {
++    if (SibHasBase(rde)) {
++      EmitAddField(b, gp + 8 * RexbBase(rde), 0);
++      if (RexbBase(rde) == 4 || RexbBase(rde) == 5) ss = true;
++    }
++    if (SibHasIndex(rde)) {
++      EmitAddField(b, gp + 8 * (Rexx(rde) << 3 | SibIndex(rde)), SibScale(rde));
++    }
++  }
++  // AddSegment: an explicit override, else the stack segment or the data segment
++  if (Sego(rde)) {
++    EmitAddField(b, offsetof(struct Machine, seg) +
++                    (Sego(rde) - 1) * sizeof(struct DescriptorCache) +
++                    offsetof(struct DescriptorCache, base), 0);
++  } else {
++    EmitAddField(b, ss ? offsetof(struct Machine, ss.base) : offsetof(struct Machine, ds.base), 0);
++  }
++  // the target (8 bytes) is read before anything is written
++  EmitTlb8(b, T_ADDR, PAGE_V | PAGE_HOST | PAGE_U, false);
++  B1(b, 0x20), BU(b, LOCAL(32)), BMem(b, 0x29, 3, 0);
++  SetRegFromStack(b, T_TARGET);
++  if (ModrmReg(rde) == 2) {
++    // return address below sp, checked before anything is written
++    B1(b, 0x20), BU(b, 0), BMem(b, 0x29, 3, offsetof(struct Machine, sp));
++    I64Const(b, 8), B1(b, 0x7d), SetRegFromStack(b, T_SP);  // i64.sub
++    EmitTlb8(b, T_SP, PAGE_V | PAGE_HOST | PAGE_U | PAGE_RW, true);
++    B1(b, 0x20), BU(b, LOCAL(32));
++    B1(b, 0x20), BU(b, 0), BMem(b, 0x29, 3, offsetof(struct Machine, ip));
++    BMem(b, 0x37, 3, 0);  // *host = m->ip
++    B1(b, 0x20), BU(b, 0), GetReg(b, T_SP), BMem(b, 0x37, 3, offsetof(struct Machine, sp));
++    B1(b, 0x20), BU(b, 0), GetReg(b, T_SP), BMem(b, 0x37, 3, offsetof(struct Machine, writeaddr));
++    B1(b, 0x20), BU(b, 0), I64Const(b, 8), BMem(b, 0x37, 3, offsetof(struct Machine, writesize));
++  }
++  // record the operand read as ReserveAddress() does, then jump
++  B1(b, 0x20), BU(b, 0), GetReg(b, T_ADDR), BMem(b, 0x37, 3, offsetof(struct Machine, readaddr));
++  B1(b, 0x20), BU(b, 0), I64Const(b, 8), BMem(b, 0x37, 3, offsetof(struct Machine, readsize));
++  B1(b, 0x20), BU(b, 0), B1(b, 0x41), BS(b, 1), BMem(b, 0x3a, 0, offsetof(struct Machine, reserving));
++  B1(b, 0x20), BU(b, 0), GetReg(b, T_TARGET), BMem(b, 0x37, 3, offsetof(struct Machine, ip));
++  B1(b, 0x0c), BU(b, 1);  // br $done
++  B1(b, 0x0b);            // end $slow
++}
++
 +// rde: arg1 when it holds a known constant (as for generic op calls), else -1.
 +static bool EmitCallMaybeFast(struct Buf *b, uintptr_t fn, i64 rde) {
 +  bool ok;
 +  uintptr_t fast;
++  if (rde != -1 && fn == (uintptr_t)GetOp(0xff) && !g_nomemfast && !g_nostackfast &&
++      IsIndirectMemory(rde)) {
++    EmitIndirectMemoryFast(b, rde);
++    ok = EmitCall(b, fn);
++    B1(b, 0x0b);  // end $done
++    return ok;
++  }
 +  if (rde != -1 && (fast = StackFastFor(fn, rde))) {
 +    // res0 is arg0 (the machine), which the real op still needs
 +    GetReg(b, kJitRes0), SetRegFromStack(b, T_VIRT);
@@ -1239,25 +1382,46 @@
 +
 +// Code for one path: a function body (locals and code), using the batch's
 +// module-wide type table.
++#include "tracewasm.inc"
++
 +static bool CompileBody(long n, struct Buf *body) {
 +  long i;
 +  int pathtype, targettype, stashtype;
 +  pathtype = TypeIndex(kSigPath);
 +  targettype = TypeIndex(kSigTarget);
 +  stashtype = TypeIndex(kSigStash);
-+  // locals: 32 i64 registers, an i32 scratch, then the inlining pools
-+  BU(body, 5);
++  // locals: 32 i64 registers, an i32 scratch, the inlining pools, then the guest state of the semantic tier
++  BU(body, 6);
 +  BU(body, 32), B1(body, 0x7e);
 +  BU(body, 1 + kPool), B1(body, 0x7f);
 +  BU(body, kPool), B1(body, 0x7e);
 +  BU(body, kPool), B1(body, 0x7d);
 +  BU(body, kPool), B1(body, 0x7c);
++  BU(body, 20), B1(body, 0x7e);
++  memset(&g_tr, 0, sizeof(g_tr));
 +  i64 arg1 = -1;  // arg1's value while it holds a constant
 +  for (i = 0; i < n; ++i) {
 +    struct Ir *ir = g_ir + i;
 +    if ((ir->op == kIrSet || ir->op == kIrMov) && ir->a == kJitArg1) {
 +      arg1 = ir->op == kIrSet ? (i64)ir->x : -1;
 +    }
++    if (ir->op == kIrGuestEnd) continue;
++    if (ir->op == kIrGuestBegin) {
++      struct TrInsn o;
++      long end;
++      if (!g_notrace && TrSpanOk(ir, n, i, &end, &o)) {
++        bool alu = o.kind == TR_ALU || o.kind == TR_ALUI;
++        TrEmit(body, &o, ir->z, !alu || !TrFlagsOverwritten(n, end));
++        if (!g_tr.in_region) g_stats.trace_regions++, g_tr.in_region = true;
++        g_stats.trace_ops++;
++        i = end;  // the span's original IR is replaced
++        arg1 = -1;
++        continue;
++      }
++      TrBarrier(body);  // not supported: the span's original IR follows
++      continue;
++    }
++    if (!TrHarmless(ir->op)) TrBarrier(body);
 +    switch (ir->op) {
 +      case kIrEnter:
 +        B1(body, 0x20), BU(body, 0), B1(body, 0xad);  // i64.extend_i32_u
@@ -1302,6 +1466,7 @@
 +        break;
 +    }
 +  }
++  TrBarrier(body);
 +  B1(body, 0x0b);  // end function (falling off the end returns to the interpreter)
 +  return pathtype >= 0 && targettype >= 0 && stashtype >= 0;
 +}
@@ -1471,7 +1636,34 @@
    res = !!CanEmulateData(m, prog, argv, isfirst, (char *)img, st.st_size);
 --- a/blink/machine.c
 +++ b/blink/machine.c
-@@ -2190,6 +2190,29 @@
+@@ -2143,6 +2143,9 @@
+     ++m->path.elements;
+     STATISTIC(++path_elements);
+     AddPath_StartOp(A);
++#ifdef __wasm__
++    AppendJitGuestBegin(m->path.jb, rde, disp, uimm0);
++#endif
+     jitpc = GetJitPc(m->path.jb);
+     JIP_LOGF("adding [%s] from address %" PRIx64
+              " to path starting at %" PRIx64,
+@@ -2165,10 +2168,16 @@
+     if (GetJitPc(m->path.jb) != jitpc) {
+       // it did; that means we're done
+       AddPath_EndOp(A);
++#ifdef __wasm__
++      AppendJitGuestEnd(m->path.jb);
++#endif
+     } else {
+       // otherwise generate "one size fits all" assembly code
+       AddPath(A);
+       AddPath_EndOp(A);
++#ifdef __wasm__
++      AppendJitGuestEnd(m->path.jb);
++#endif
+       STATISTIC(++path_elements_auto);
+     }
+     if (opclass == kOpBranching) {
+@@ -2190,6 +2199,29 @@
    nexgen32e_f func;
    unassert(m->canhalt);
    if (CanJit(m)) {
@@ -1953,6 +2145,323 @@
 +  Blink(m);
 +}
 +#endif /* __wasm__ */
+--- a/blink/tracewasm.inc
++++ b/blink/tracewasm.inc
+@@ -0,0 +1,314 @@
++// Register-only semantic tier for blink-jitwasm.c (included after EmitJump, before CompileBody).
++//
++// Inside a span that GeneralDispatch recorded for one supported guest instruction (see
++// AppendJitGuestBegin), the instruction is emitted as wasm on guest locals GL(r) instead of the
++// generic micro-op calls: GPRs are loaded from Machine.weg when first read and kept in locals while
++// they are written, and the arithmetic flags are computed into a local. Everything else is a
++// barrier: dirty GPRs and flags are spilled to Machine, and the locals are dropped, before any
++// original IR, branch, return or call. The code is straight-line, so no state crosses a label.
++// An ALU op's flags are computed unless a later supported ALU overwrites them before a barrier (see
++// TrFlagsOverwritten); spilled flags are complete. Parity stays Blink's lazy LP byte.
++
++#define GL(r) (POOL_F64 + kPool + (r))  // guest GPRs 0..15, flags 16, scratch 17..19
++#define G_FLAGS 16
++#define G_LHS 17
++#define G_RHS 18
++#define G_RES 19
++
++// Flag bits a supported ALU instruction defines (CF AF ZF SF OF, and the lazy parity byte).
++#define TR_CF 0x001u
++#define TR_AF 0x010u
++#define TR_ZF 0x040u
++#define TR_SF 0x080u
++#define TR_OF 0x800u
++#define TR_ARITH (TR_CF | TR_AF | TR_ZF | TR_SF | TR_OF | 0xff000000u)
++
++enum { TR_MOV = 1, TR_MOVI, TR_ALU, TR_ALUI };
++enum { TR_ADD, TR_OR, TR_AND, TR_SUB, TR_XOR };
++
++static struct {
++  u32 valid;         // GPR i: GL(i) holds its value
++  u32 dirty;         // GPR i: GL(i) is newer than Machine.weg
++  bool flags_dirty;  // GL(G_FLAGS) holds arithmetic flags not yet in Machine.flags
++  bool in_region;    // inside a run of semantic spans (trace_regions)
++} g_tr;
++
++struct TrInsn {
++  int kind, aop, dst, src, w;
++  bool regsrc;
++};
++
++static void TrLocal(struct Buf *b, int l) {
++  B1(b, 0x20), BU(b, GL(l));
++}
++
++static void TrSetLocal(struct Buf *b, int l) {
++  B1(b, 0x21), BU(b, GL(l));
++}
++
++// pushes guest register r, loading it from Machine on first use since the last barrier
++static void TrGet(struct Buf *b, int r) {
++  if (!(g_tr.valid >> r & 1)) {
++    B1(b, 0x20), BU(b, 0);
++    BMem(b, 0x29, 3, offsetof(struct Machine, weg) + 8 * r);
++    TrSetLocal(b, r);
++    g_tr.valid |= 1u << r;
++  }
++  TrLocal(b, r);
++}
++
++// pops an i64 into guest register r
++static void TrPut(struct Buf *b, int r) {
++  TrSetLocal(b, r);
++  g_tr.valid |= 1u << r;
++  g_tr.dirty |= 1u << r;
++}
++
++// Writes dirty guest state back to Machine. The locals stay valid; TrBarrier drops them.
++static void TrSpill(struct Buf *b) {
++  int r;
++  const u32 foff = offsetof(struct Machine, flags);
++  for (r = 0; r < 16; ++r) {
++    if (!(g_tr.dirty >> r & 1)) continue;
++    B1(b, 0x20), BU(b, 0);
++    TrLocal(b, r);
++    BMem(b, 0x37, 3, offsetof(struct Machine, weg) + 8 * r);
++  }
++  if (g_tr.flags_dirty) {  // m->flags = (m->flags & ~TR_ARITH) | (flags & TR_ARITH)
++    B1(b, 0x20), BU(b, 0);
++    B1(b, 0x20), BU(b, 0), BMem(b, 0x28, 2, foff);
++    B1(b, 0x41), BS(b, (i32)~TR_ARITH), B1(b, 0x71);
++    TrLocal(b, G_FLAGS), B1(b, 0xa7);
++    B1(b, 0x41), BS(b, (i32)TR_ARITH), B1(b, 0x71), B1(b, 0x72);
++    BMem(b, 0x36, 2, foff);
++  }
++  g_tr.dirty = 0;
++  g_tr.flags_dirty = false;
++}
++
++// Any original code may read or write guest state: spill, then forget the locals.
++static void TrBarrier(struct Buf *b) {
++  TrSpill(b);
++  g_tr.valid = 0;
++  g_tr.in_region = false;
++}
++
++static const u8 kTrAluWasm[5] = {0x7c, 0x84, 0x83, 0x7d, 0x85};  // i64 add, or, and, sub, xor
++static const u8 kTrAluFlags[5] = {0, 2, 2, 1, 2};                // 0 add, 1 sub, 2 logic
++
++// pops an i64 and pushes its bit `sh` as 0 or 1
++static void TrBit(struct Buf *b, int sh) {
++  I64Const(b, sh), B1(b, 0x88);  // i64.shr_u
++  I64Const(b, 1), B1(b, 0x83);   // i64.and
++}
++
++// pops a 0/1 bit and ORs it into the accumulator below it, at position pos
++static void TrTerm(struct Buf *b, int pos) {
++  I64Const(b, pos), B1(b, 0x86), B1(b, 0x84);  // i64.shl, i64.or
++}
++
++// G_FLAGS = the flag bits of the last ALU op, from G_LHS, G_RHS (masked to the width) and G_RES.
++// sign is the width's sign bit. PF is not written: the lazy parity byte is the LP term.
++static void TrFlags(struct Buf *b, int kind, int sign) {
++  I64Const(b, 0);
++  if (kind == 0) {  // CF = res <u lhs
++    TrLocal(b, G_RES), TrLocal(b, G_LHS), B1(b, 0x54), B1(b, 0xad), TrTerm(b, 0);
++  } else if (kind == 1) {  // CF = lhs <u rhs
++    TrLocal(b, G_LHS), TrLocal(b, G_RHS), B1(b, 0x54), B1(b, 0xad), TrTerm(b, 0);
++  }
++  if (kind != 2) {  // AF = bit 4 of lhs ^ rhs ^ res
++    TrLocal(b, G_LHS), TrLocal(b, G_RHS), B1(b, 0x85), TrLocal(b, G_RES), B1(b, 0x85);
++    TrBit(b, 4), TrTerm(b, 4);
++  }
++  TrLocal(b, G_RES), B1(b, 0x50), B1(b, 0xad), TrTerm(b, 6);  // ZF = res == 0
++  TrLocal(b, G_RES), TrBit(b, sign), TrTerm(b, 7);            // SF = sign of res
++  if (kind == 0) {  // OF = sign of (lhs ^ res) & (rhs ^ res)
++    TrLocal(b, G_LHS), TrLocal(b, G_RES), B1(b, 0x85);
++    TrLocal(b, G_RHS), TrLocal(b, G_RES), B1(b, 0x85), B1(b, 0x83);
++    TrBit(b, sign), TrTerm(b, 11);
++  } else if (kind == 1) {  // OF = sign of (lhs ^ rhs) & (lhs ^ res)
++    TrLocal(b, G_LHS), TrLocal(b, G_RHS), B1(b, 0x85);
++    TrLocal(b, G_LHS), TrLocal(b, G_RES), B1(b, 0x85), B1(b, 0x83);
++    TrBit(b, sign), TrTerm(b, 11);
++  }
++  TrLocal(b, G_RES), I64Const(b, 255), B1(b, 0x83), I64Const(b, 24), B1(b, 0x86), B1(b, 0x84);  // LP
++  TrSetLocal(b, G_FLAGS);
++  g_tr.flags_dirty = true;
++}
++
++// dst = dst op src (or imm), with the result zero-extended for 32-bit operands. The flags are only
++// computed when flags_live; an elided set leaves the flag state as it was (see TrFlagsOverwritten).
++static void TrAlu(struct Buf *b, const struct TrInsn *o, i64 imm, bool flags_live) {
++  i64 m = o->w == 64 ? -1 : 0xffffffffLL;
++  TrGet(b, o->dst), I64Const(b, m), B1(b, 0x83), TrSetLocal(b, G_LHS);
++  if (o->regsrc) {
++    TrGet(b, o->src), I64Const(b, m), B1(b, 0x83);
++  } else {
++    I64Const(b, imm & m);
++  }
++  TrSetLocal(b, G_RHS);
++  TrLocal(b, G_LHS), TrLocal(b, G_RHS), B1(b, kTrAluWasm[o->aop]);
++  I64Const(b, m), B1(b, 0x83), TrSetLocal(b, G_RES);
++  if (flags_live) {
++    TrFlags(b, kTrAluFlags[o->aop], o->w == 64 ? 63 : 31);
++  } else {
++    g_stats.flag_elided++;
++  }
++  TrLocal(b, G_RES), TrPut(b, o->dst);
++}
++
++static void TrMovReg(struct Buf *b, int dst, int src, int w) {
++  TrGet(b, src);
++  if (w == 32) I64Const(b, 0xffffffffLL), B1(b, 0x83);
++  TrPut(b, dst);
++}
++
++static void TrMovImm(struct Buf *b, int dst, i64 imm, int w) {
++  I64Const(b, w == 64 ? imm : imm & 0xffffffffLL);
++  TrPut(b, dst);
++}
++
++// Whether a supported register-only instruction; fills in what TrEmit needs. Excludes 8/16-bit
++// operands (66 prefix, byte opcodes), memory operands, segments, LOCK, REP, two-byte opcodes.
++static bool TrClassify(u64 rde, struct TrInsn *o) {
++  u32 op = Mopcode(rde);
++  int low;
++  if (Osz(rde) || Lock(rde) || Rep(rde) || Opmap(rde) || Sego(rde) || Mode(rde) != XED_MODE_LONG) return false;
++  o->w = Rexw(rde) ? 64 : 32;
++  o->regsrc = false;
++  switch (op) {
++    case 0x81:
++    case 0x83:
++      if (!IsModrmRegister(rde)) return false;
++      switch (ModrmReg(rde)) {
++        case 0: o->aop = TR_ADD; break;
++        case 1: o->aop = TR_OR; break;
++        case 4: o->aop = TR_AND; break;
++        case 5: o->aop = TR_SUB; break;
++        case 6: o->aop = TR_XOR; break;
++        default: return false;
++      }
++      o->kind = TR_ALUI;
++      o->dst = RexbRm(rde);
++      return true;
++    case 0xc7:
++      if (!IsModrmRegister(rde) || ModrmReg(rde)) return false;
++      o->kind = TR_MOVI;
++      o->dst = RexbRm(rde);
++      return true;
++    case 0x89:
++    case 0x8b:
++      if (!IsModrmRegister(rde)) return false;
++      o->kind = TR_MOV;
++      if (op == 0x89) {
++        o->dst = RexbRm(rde), o->src = RexrReg(rde);
++      } else {
++        o->dst = RexrReg(rde), o->src = RexbRm(rde);
++      }
++      return true;
++    default:
++      break;
++  }
++  if (op >= 0xb8 && op <= 0xbf) {  // mov r, imm (imm64 with REX.W)
++    o->kind = TR_MOVI;
++    o->dst = RexbSrm(rde);
++    return true;
++  }
++  low = op & 7;  // ALU r/m, r (1) and r, r/m (3)
++  if (low != 1 && low != 3) return false;
++  switch (op & 0xf8) {
++    case 0x00: o->aop = TR_ADD; break;
++    case 0x08: o->aop = TR_OR; break;
++    case 0x20: o->aop = TR_AND; break;
++    case 0x28: o->aop = TR_SUB; break;
++    case 0x30: o->aop = TR_XOR; break;
++    default: return false;
++  }
++  if (!IsModrmRegister(rde)) return false;
++  o->kind = TR_ALU;
++  o->regsrc = true;
++  if (low == 1) {
++    o->dst = RexbRm(rde), o->src = RexrReg(rde);
++  } else {
++    o->dst = RexrReg(rde), o->src = RexbRm(rde);
++  }
++  return true;
++}
++
++// IR that may run before a span without disturbing the guest state
++static bool TrHarmless(int op) {
++  return op == kIrSet || op == kIrMov || op == kIrEnter;
++}
++
++// Whether the span begun at g_ir[i] is one supported instruction, with its end found; sets *end.
++// A span that is unterminated, or that holds a branch, stash, return, trap or another span, is not.
++static bool TrSpanOk(const struct Ir *ir, long n, long i, long *end, struct TrInsn *o) {
++  long j;
++  for (j = i + 1; j < n; ++j) {
++    switch (g_ir[j].op) {
++      case kIrGuestEnd:
++        *end = j;
++        return TrClassify(ir->x, o);
++      case kIrGuestBegin:
++      case kIrStash:
++      case kIrSkipZ:
++      case kIrSkipNz:
++      case kIrSkipCmp:
++      case kIrJump:
++      case kIrJumpLazy:
++      case kIrRet:
++      case kIrTrap:
++      case kIrEnter:
++        return false;
++      default:
++        break;
++    }
++  }
++  return false;
++}
++
++// Whether the arithmetic flags defined by the ALU span ending at g_ir[end] are overwritten before anything
++// can observe them: a linear lookahead that passes only kIrSet/kIrMov, harmless metadata and supported
++// MOVs, and finds a supported ALU (which defines every arithmetic flag and reads none). Any other op,
++// an unsupported or unterminated span, or the end of the body means the flags are live.
++static bool TrFlagsOverwritten(long n, long end) {
++  long j = end + 1;
++  while (j < n) {
++    const struct Ir *ir = g_ir + j;
++    struct TrInsn o;
++    long e;
++    switch (ir->op) {
++      case kIrSet:
++      case kIrMov:
++      case kIrGuestEnd:
++        ++j;
++        continue;
++      case kIrGuestBegin:
++        if (!TrSpanOk(ir, n, j, &e, &o)) return false;
++        if (o.kind == TR_ALU || o.kind == TR_ALUI) return true;
++        if (o.kind != TR_MOV && o.kind != TR_MOVI) return false;
++        j = e + 1;
++        continue;
++      default:
++        return false;
++    }
++  }
++  return false;
++}
++
++static void TrEmit(struct Buf *b, const struct TrInsn *o, u64 uimm, bool flags_live) {
++  switch (o->kind) {
++    case TR_MOV:
++      TrMovReg(b, o->dst, o->src, o->w);
++      break;
++    case TR_MOVI:
++      TrMovImm(b, o->dst, (i64)uimm, o->w);
++      break;
++    case TR_ALU:
++      TrAlu(b, o, 0, flags_live);
++      break;
++    case TR_ALUI:
++      TrAlu(b, o, (i64)uimm, flags_live);
++      break;
++  }
++}
 --- a/blink/uop.c
 +++ b/blink/uop.c
 @@ -2098,3 +2098,10 @@

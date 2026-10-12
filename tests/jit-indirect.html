@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>winix jit-indirect</title>
+<pre id="out"></pre>
+<script type="module">
+import { Winix } from './winix.js';
+
+const out = document.getElementById('out');
+const results = (window.__results = { modes: {}, error: null });
+const log = (s) => { out.textContent += s + '\n'; };
+
+const EXPECTED = 'disp 20000\njmp 20000\nrip 20000\nsib 30000\nalt 30000\ncross 20000\nsp 20000\naddr32 20000\n' +
+  'fs 20000\nstackcross 20000\n';
+const MODE_TIMEOUT_MS = 120000;
+const MODES = {
+  nojit: 'WINIX_NOJIT=1 WINIX_JITSTATS=1',
+  jit: 'WINIX_JITHOT=1 WINIX_JIT_BATCH=1 WINIX_JITSTATS=1',
+  nostackfast: 'WINIX_JITHOT=1 WINIX_JIT_BATCH=1 WINIX_JIT_NOSTACKFAST=1 WINIX_JITSTATS=1',
+};
+
+let w = null;
+try {
+  w = await Winix.boot();
+  log('booted');
+  const res = await fetch('fixtures/jit-indirect.bin');
+  if (!res.ok) throw new Error('fetching fixtures/jit-indirect.bin: HTTP ' + res.status);
+  await w.writeFile('/work/ji', new Uint8Array(await res.arrayBuffer()));
+  const inst = await w.exec('apt install blink', { timeoutMs: MODE_TIMEOUT_MS });
+  results.install = { exitCode: inst.exitCode, timedOut: inst.timedOut, stderr: inst.stderr.slice(-300) };
+  log('apt install blink: exit ' + inst.exitCode);
+  await w.exec('chmod +x /work/ji');
+  for (const [name, env] of Object.entries(MODES)) {
+    const r = await w.exec(`${env} blink /work/ji`, { timeoutMs: MODE_TIMEOUT_MS });
+    const stat = /\[blink wasm jit\][^\n]*/.exec(r.stderr)?.[0] ?? '';
+    const m = /paths=(\d+) failed=(\d+)/.exec(stat);
+    results.modes[name] = {
+      stdoutOk: r.stdout === EXPECTED,
+      stdout: r.stdout,
+      exitCode: r.exitCode,
+      timedOut: r.timedOut,
+      truncated: r.truncated,
+      stat,
+      paths: m ? Number(m[1]) : null,
+      failed: m ? Number(m[2]) : null,
+      stderr: r.stderr.replace(/\[blink wasm jit\][^\n]*\n?/g, '').slice(0, 400),
+    };
+    log(`${name}: exit ${r.exitCode} stdoutOk=${r.stdout === EXPECTED} ${stat}`);
+  }
+} catch (e) {
+  results.error = String(e.message || e);
+  log('ERROR ' + results.error);
+} finally {
+  w?.dispose();
+  window.__done = true;
+}
+</script>

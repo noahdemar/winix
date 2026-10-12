@@ -447,12 +447,36 @@ edit(root + '/blink/jit.h', [
      '#define kWasmEnder ((uintptr_t)1)\n'
      'bool AppendJitStashCheck(struct JitBlock *);\n'
      'uintptr_t WinixJitProbe(i64, bool *);\n'
+     'bool AppendJitGuestBegin(struct JitBlock *, u64, i64, u64);\n'
+     'bool AppendJitGuestEnd(struct JitBlock *);\n'
      '#endif\n\n'
      'extern const u8 kJitRes[2];\n'),
 ])
 wrap(root + '/blink/jit.c', '!defined(__wasm__)  // see jitwasm.c')
 wrap(root + '/blink/jitflush.c', '!defined(__wasm__)  // see jitwasm.c')
 open(root + '/blink/jitwasm.c', 'w').write(open(os.path.join(here, 'blink-jitwasm.c')).read())
+open(root + '/blink/tracewasm.inc', 'w').write(open(os.path.join(here, 'blink-tracewasm.inc')).read())
+# guest instruction spans for the semantic tier (blink-tracewasm.inc): markers only, ignored by the old paths
+edit(root + '/blink/machine.c', [
+    ('    AddPath_StartOp(A);\n    jitpc = GetJitPc(m->path.jb);\n',
+     '    AddPath_StartOp(A);\n'
+     '#ifdef __wasm__\n'
+     '    AppendJitGuestBegin(m->path.jb, rde, disp, uimm0);\n'
+     '#endif\n'
+     '    jitpc = GetJitPc(m->path.jb);\n'),
+    ('      AddPath_EndOp(A);\n    } else {\n',
+     '      AddPath_EndOp(A);\n'
+     '#ifdef __wasm__\n'
+     '      AppendJitGuestEnd(m->path.jb);\n'
+     '#endif\n'
+     '    } else {\n'),
+    ('      AddPath_EndOp(A);\n      STATISTIC(++path_elements_auto);\n',
+     '      AddPath_EndOp(A);\n'
+     '#ifdef __wasm__\n'
+     '      AppendJitGuestEnd(m->path.jb);\n'
+     '#endif\n'
+     '      STATISTIC(++path_elements_auto);\n'),
+])
 edit(root + '/blink/path.c', [
     ('#endif /* __x86_64__ */\n#endif /* HAVE_JIT */\n\nlong GetPrologueSize(void) {\n#ifdef HAVE_JIT\n',
      '#elif defined(__wasm__)\n'

@@ -1,0 +1,10 @@
+disp 20000
+jmp 20000
+rip 20000
+sib 30000
+alt 30000
+cross 20000
+sp 20000
+addr32 20000
+fs 20000
+stackcross 20000

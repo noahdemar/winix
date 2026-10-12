@@ -56,12 +56,14 @@ enum {
   kIrSkipNz,   // skip the next jump if reg != 0
   kIrSkipCmp,  // skip the next jump if cond(a - b)
   kIrStash,    // if (m->stashaddr) CommitStash(m)
+  kIrGuestBegin,  // metadata: x = rde, y = disp, z = uimm0 of one guest instruction
+  kIrGuestEnd,    // metadata: the instruction's span ends here
 };
 
 struct Ir {
   u8 op, a, b, wide;  // wide: 64-bit compare
   u32 cond;
-  u64 x;
+  u64 x, y, z;
 };
 
 #define kIrMax (kJitBlockSize / sizeof(struct Ir))
@@ -80,9 +82,11 @@ static unsigned g_hot = 3000;  // WINIX_JITHOT: below ~1000 startup costs more t
 static bool g_noinline;      // WINIX_JIT_NOINLINE
 static bool g_nomemfast;     // WINIX_JIT_NOMEMFAST
 static bool g_nostackfast;   // WINIX_JIT_NOSTACKFAST
+static bool g_notrace;       // experimental semantic tier: WINIX_JIT_TRACE enables, WINIX_JIT_NOTRACE overrides
 static int g_batch_max = 16;  // WINIX_JIT_BATCH: paths per module
 static struct {
   long started, abandoned, paths, failed, ops, bytes, batches;
+  long trace_ops, trace_regions, flag_elided;  // emitted code: guest instructions, regions, elided flag sets
   double ms, wasm_ms;
 } g_stats;
 
@@ -93,12 +97,13 @@ static double NowMs(void) {
 }
 
 static void PrintStats(void) {
-  char b[192];
+  char b[256];
   snprintf(b, sizeof(b),
            "[blink wasm jit] started=%ld abandoned=%ld paths=%ld failed=%ld ops=%ld modules=%ld bytes=%ld "
-           "compile=%.0fms (wasm %.0fms)\n",
+           "compile=%.0fms (wasm %.0fms) trace_ops=%ld trace_regions=%ld flag_elided=%ld\n",
            g_stats.started, g_stats.abandoned, g_stats.paths, g_stats.failed, g_stats.ops, g_stats.batches,
-           g_stats.bytes, g_stats.ms, g_stats.wasm_ms);
+           g_stats.bytes, g_stats.ms, g_stats.wasm_ms, g_stats.trace_ops, g_stats.trace_regions,
+           g_stats.flag_elided);
   write(2, b, strlen(b));
 }
 
@@ -237,6 +242,7 @@ int InitJit(struct Jit *jit, uintptr_t opt_staging_function) {
   g_noinline = !!getenv("WINIX_JIT_NOINLINE");
   g_nomemfast = !!getenv("WINIX_JIT_NOMEMFAST");
   g_nostackfast = !!getenv("WINIX_JIT_NOSTACKFAST");
+  g_notrace = !getenv("WINIX_JIT_TRACE") || !!getenv("WINIX_JIT_NOTRACE");
   if (getenv("WINIX_JIT_BATCH")) g_batch_max = atoi(getenv("WINIX_JIT_BATCH"));
   if (g_batch_max < 1 || g_batch_max > 26) g_batch_max = 16;
   static bool stats;
@@ -362,6 +368,15 @@ bool AppendJitMovReg(struct JitBlock *jb, int dst, int src) {
 }
 bool AppendJitStashCheck(struct JitBlock *jb) {
   return Emit(jb, (struct Ir){.op = kIrStash});
+}
+
+// Guest instruction span markers, recorded by GeneralDispatch around one instruction's path code.
+bool AppendJitGuestBegin(struct JitBlock *jb, u64 rde, i64 disp, u64 uimm0) {
+  return Emit(jb, (struct Ir){.op = kIrGuestBegin, .x = rde, .y = (u64)disp, .z = uimm0});
+}
+
+bool AppendJitGuestEnd(struct JitBlock *jb) {
+  return Emit(jb, (struct Ir){.op = kIrGuestEnd});
 }
 
 bool RecordJitJump(struct JitBlock *jb, u64 virt, int addend) {
@@ -930,10 +945,136 @@ static uintptr_t StackFastFor(uintptr_t fn, u64 rde) {
 
 static bool EmitCall(struct Buf *b, uintptr_t fn);
 
+#define T_ADDR   26  // virtual address of a memory operand
+#define T_TARGET 27  // the code address read from it
+#define T_SP     28  // stack pointer below a call's return address
+
+// Leaves the branch to the enclosing $slow block when the 8 bytes at virtual
+// register vreg (within one page) are not a TLB hit with the permissions
+// `need`; the checks mirror EmitReserveFast. On a hit LOCAL(32) holds the host
+// address. Uses no blocks of its own, so the br depth is the one $slow.
+static void EmitTlb8(struct Buf *b, int vreg, u64 need, bool writing) {
+  const u32 tlb = offsetof(struct Machine, tlb);
+  B1(b, 0x20), BU(b, 0), BMem(b, 0x2d, 0, offsetof(struct Machine, invalidated));
+  B1(b, 0x20), BU(b, 0), BMem(b, 0x2d, 0, offsetof(struct Machine, metal));
+  B1(b, 0x72);  // i32.or
+  GetReg(b, vreg), I64Const(b, 4095), B1(b, 0x83), I64Const(b, 4088), B1(b, 0x56);
+  B1(b, 0x72);
+  // slot = m + ((v >> 12) & (TLB size - 1)) * 16
+  B1(b, 0x20), BU(b, 0);
+  GetReg(b, vreg), I64Const(b, 12), B1(b, 0x88), B1(b, 0xa7);
+  B1(b, 0x41), BS(b, ARRAYLEN(((struct Machine *)0)->tlb) - 1), B1(b, 0x71);
+  B1(b, 0x41), BS(b, 4), B1(b, 0x74), B1(b, 0x6a);
+  B1(b, 0x21), BU(b, LOCAL(32));
+  // slot->page != (v & -4096)
+  B1(b, 0x20), BU(b, LOCAL(32)), BMem(b, 0x29, 3, tlb);
+  GetReg(b, vreg), I64Const(b, -4096), B1(b, 0x83), B1(b, 0x52);
+  B1(b, 0x72);
+  // entry lacks the permissions needed
+  B1(b, 0x20), BU(b, LOCAL(32)), BMem(b, 0x29, 3, tlb + 8);
+  SetRegFromStack(b, T_ENTRY);
+  GetReg(b, T_ENTRY), I64Const(b, need), B1(b, 0x83), I64Const(b, need), B1(b, 0x52);
+  B1(b, 0x72);
+  if (writing) {  // writable and executable (no XD): not a fast write
+    GetReg(b, T_ENTRY), I64Const(b, PAGE_U | PAGE_RW | PAGE_XD), B1(b, 0x83);
+    I64Const(b, PAGE_U | PAGE_RW), B1(b, 0x51);
+    B1(b, 0x72);
+  }
+  B1(b, 0x0d), BU(b, 0);  // br_if $slow
+  // host = (entry & PAGE_TA) + (v & 4095)
+  GetReg(b, T_ENTRY), B1(b, 0xa7), B1(b, 0x41), BS(b, (i32)0xfffff000), B1(b, 0x71);
+  GetReg(b, vreg), B1(b, 0xa7), B1(b, 0x41), BS(b, 4095), B1(b, 0x71), B1(b, 0x6a);
+  B1(b, 0x21), BU(b, LOCAL(32));
+}
+
+// T_ADDR += (i64)(m-field at off) << shift
+static void EmitAddField(struct Buf *b, u32 off, int shift) {
+  GetReg(b, T_ADDR);
+  B1(b, 0x20), BU(b, 0), BMem(b, 0x29, 3, off);
+  if (shift) I64Const(b, shift), B1(b, 0x86);  // i64.shl
+  B1(b, 0x7c), SetRegFromStack(b, T_ADDR);     // i64.add
+}
+
+// Memory operands of `ff /2` and `ff /4` in long mode with no address-size
+// or operand-size prefix, and a segment override the table holds.
+static bool IsIndirectMemory(u64 rde) {
+  if (Osz(rde) || IsModrmRegister(rde) || Eamode(rde) != XED_MODE_LONG) return false;
+  if (Sego(rde) > 6) return false;
+  return ModrmReg(rde) == 2 || ModrmReg(rde) == 4;
+}
+
+// block $done; block $slow; <fast path>; end $slow -- the caller emits the
+// slow call and the final `end $done`. The fast path computes the operand's
+// address exactly as LoadEffectiveAddress does for this rde, reads the target
+// through the TLB, and for call pushes the return address; the guest state is
+// only written after every check has passed, so a miss runs the real op.
+// The target is not cached across executions: it is read every time.
+static void EmitIndirectMemoryFast(struct Buf *b, u64 rde) {
+  const u32 gp = offsetof(struct Machine, weg);
+  bool ss = false;
+  B1(b, 0x02), B1(b, 0x40);  // block $done
+  B1(b, 0x02), B1(b, 0x40);  // block $slow
+  GetReg(b, kJitArg2), SetRegFromStack(b, T_ADDR);  // disp
+  if (!SibExists(rde)) {
+    if (IsRipRelative(rde)) {
+      EmitAddField(b, offsetof(struct Machine, ip), 0);
+    } else {
+      EmitAddField(b, gp + 8 * RexbRm(rde), 0);
+      if (RexbRm(rde) == 4 || RexbRm(rde) == 5) ss = true;
+    }
+  } else {
+    if (SibHasBase(rde)) {
+      EmitAddField(b, gp + 8 * RexbBase(rde), 0);
+      if (RexbBase(rde) == 4 || RexbBase(rde) == 5) ss = true;
+    }
+    if (SibHasIndex(rde)) {
+      EmitAddField(b, gp + 8 * (Rexx(rde) << 3 | SibIndex(rde)), SibScale(rde));
+    }
+  }
+  // AddSegment: an explicit override, else the stack segment or the data segment
+  if (Sego(rde)) {
+    EmitAddField(b, offsetof(struct Machine, seg) +
+                    (Sego(rde) - 1) * sizeof(struct DescriptorCache) +
+                    offsetof(struct DescriptorCache, base), 0);
+  } else {
+    EmitAddField(b, ss ? offsetof(struct Machine, ss.base) : offsetof(struct Machine, ds.base), 0);
+  }
+  // the target (8 bytes) is read before anything is written
+  EmitTlb8(b, T_ADDR, PAGE_V | PAGE_HOST | PAGE_U, false);
+  B1(b, 0x20), BU(b, LOCAL(32)), BMem(b, 0x29, 3, 0);
+  SetRegFromStack(b, T_TARGET);
+  if (ModrmReg(rde) == 2) {
+    // return address below sp, checked before anything is written
+    B1(b, 0x20), BU(b, 0), BMem(b, 0x29, 3, offsetof(struct Machine, sp));
+    I64Const(b, 8), B1(b, 0x7d), SetRegFromStack(b, T_SP);  // i64.sub
+    EmitTlb8(b, T_SP, PAGE_V | PAGE_HOST | PAGE_U | PAGE_RW, true);
+    B1(b, 0x20), BU(b, LOCAL(32));
+    B1(b, 0x20), BU(b, 0), BMem(b, 0x29, 3, offsetof(struct Machine, ip));
+    BMem(b, 0x37, 3, 0);  // *host = m->ip
+    B1(b, 0x20), BU(b, 0), GetReg(b, T_SP), BMem(b, 0x37, 3, offsetof(struct Machine, sp));
+    B1(b, 0x20), BU(b, 0), GetReg(b, T_SP), BMem(b, 0x37, 3, offsetof(struct Machine, writeaddr));
+    B1(b, 0x20), BU(b, 0), I64Const(b, 8), BMem(b, 0x37, 3, offsetof(struct Machine, writesize));
+  }
+  // record the operand read as ReserveAddress() does, then jump
+  B1(b, 0x20), BU(b, 0), GetReg(b, T_ADDR), BMem(b, 0x37, 3, offsetof(struct Machine, readaddr));
+  B1(b, 0x20), BU(b, 0), I64Const(b, 8), BMem(b, 0x37, 3, offsetof(struct Machine, readsize));
+  B1(b, 0x20), BU(b, 0), B1(b, 0x41), BS(b, 1), BMem(b, 0x3a, 0, offsetof(struct Machine, reserving));
+  B1(b, 0x20), BU(b, 0), GetReg(b, T_TARGET), BMem(b, 0x37, 3, offsetof(struct Machine, ip));
+  B1(b, 0x0c), BU(b, 1);  // br $done
+  B1(b, 0x0b);            // end $slow
+}
+
 // rde: arg1 when it holds a known constant (as for generic op calls), else -1.
 static bool EmitCallMaybeFast(struct Buf *b, uintptr_t fn, i64 rde) {
   bool ok;
   uintptr_t fast;
+  if (rde != -1 && fn == (uintptr_t)GetOp(0xff) && !g_nomemfast && !g_nostackfast &&
+      IsIndirectMemory(rde)) {
+    EmitIndirectMemoryFast(b, rde);
+    ok = EmitCall(b, fn);
+    B1(b, 0x0b);  // end $done
+    return ok;
+  }
   if (rde != -1 && (fast = StackFastFor(fn, rde))) {
     // res0 is arg0 (the machine), which the real op still needs
     GetReg(b, kJitRes0), SetRegFromStack(b, T_VIRT);
@@ -1121,25 +1262,46 @@ static bool EmitJump(struct Buf *b, const struct Ir *ir, int pathtype, int targe
 
 // Code for one path: a function body (locals and code), using the batch's
 // module-wide type table.
+#include "tracewasm.inc"
+
 static bool CompileBody(long n, struct Buf *body) {
   long i;
   int pathtype, targettype, stashtype;
   pathtype = TypeIndex(kSigPath);
   targettype = TypeIndex(kSigTarget);
   stashtype = TypeIndex(kSigStash);
-  // locals: 32 i64 registers, an i32 scratch, then the inlining pools
-  BU(body, 5);
+  // locals: 32 i64 registers, an i32 scratch, the inlining pools, then the guest state of the semantic tier
+  BU(body, 6);
   BU(body, 32), B1(body, 0x7e);
   BU(body, 1 + kPool), B1(body, 0x7f);
   BU(body, kPool), B1(body, 0x7e);
   BU(body, kPool), B1(body, 0x7d);
   BU(body, kPool), B1(body, 0x7c);
+  BU(body, 20), B1(body, 0x7e);
+  memset(&g_tr, 0, sizeof(g_tr));
   i64 arg1 = -1;  // arg1's value while it holds a constant
   for (i = 0; i < n; ++i) {
     struct Ir *ir = g_ir + i;
     if ((ir->op == kIrSet || ir->op == kIrMov) && ir->a == kJitArg1) {
       arg1 = ir->op == kIrSet ? (i64)ir->x : -1;
     }
+    if (ir->op == kIrGuestEnd) continue;
+    if (ir->op == kIrGuestBegin) {
+      struct TrInsn o;
+      long end;
+      if (!g_notrace && TrSpanOk(ir, n, i, &end, &o)) {
+        bool alu = o.kind == TR_ALU || o.kind == TR_ALUI;
+        TrEmit(body, &o, ir->z, !alu || !TrFlagsOverwritten(n, end));
+        if (!g_tr.in_region) g_stats.trace_regions++, g_tr.in_region = true;
+        g_stats.trace_ops++;
+        i = end;  // the span's original IR is replaced
+        arg1 = -1;
+        continue;
+      }
+      TrBarrier(body);  // not supported: the span's original IR follows
+      continue;
+    }
+    if (!TrHarmless(ir->op)) TrBarrier(body);
     switch (ir->op) {
       case kIrEnter:
         B1(body, 0x20), BU(body, 0), B1(body, 0xad);  // i64.extend_i32_u
@@ -1184,6 +1346,7 @@ static bool CompileBody(long n, struct Buf *body) {
         break;
     }
   }
+  TrBarrier(body);
   B1(body, 0x0b);  // end function (falling off the end returns to the interpreter)
   return pathtype >= 0 && targettype >= 0 && stashtype >= 0;
 }

@@ -75,6 +75,20 @@ Packages are built with `setjmp`/`longjmp` lowered to wasm exceptions (`guest/sj
   - 64-bit push, pop, call, ret and register `call`/`jmp` use call-free fast versions with the same TLB check,
     falling back to Blink's op when it misses (`WINIX_JIT_NOSTACKFAST=1` disables them; Blink's own stack
     micro-ops need linear memory);
+  - an **experimental register-only semantic tier** (`packages/blink-tracewasm.inc`), **opt-in** with
+    `WINIX_JIT_TRACE=1`; `WINIX_JIT_NOTRACE=1` overrides it off. The default remains the original micro-op backend.
+    The first prototype showed a small gain on a loop benchmark but a regression on mixed code in a single-sample
+    check, so it is not on by default, and it is not near-native. Inside straight-line runs of supported
+    instructions (MOV reg/reg, MOV immediate, ADD/OR/AND/SUB/XOR reg/reg and with imm8/imm32, all in 32- or 64-bit
+    operand size), guest GPRs are kept in wasm locals and written back to Blink's register file before any other
+    code runs. An ALU instruction's flags are not computed when a later supported ALU overwrites all of them before
+    any barrier: this is a local, straight-line check, not a whole-function analysis. Otherwise the flags are
+    computed in full, and they are written back to Blink's flag register at every barrier. Anything else (memory,
+    8/16-bit, branches, calls, stash checks, other instructions) is a barrier: state is spilled and the original path
+    runs. Without `WINIX_JIT_TRACE` the markers are ignored.
+  - memory-operand `call *m` and `jmp *m` (`ff /2`, `ff /4`) are inlined under the same TLB guard: the effective
+    address is computed from the instruction, the target is reread on every execution, and a cross-page operand, a
+    missing permission, or a `0x67` address-size prefix falls back to Blink's op;
   - paths chain with tail calls, through per-site cache cells, and dispatch in place instead of returning to the
     interpreter; Blink's few raw ARM branch encodings are decoded into wasm conditionals;
   - finished paths are compiled in batches of up to 16 per module (`WINIX_JIT_BATCH`), since the browser's fixed
@@ -84,6 +98,10 @@ Packages are built with `setjmp`/`longjmp` lowered to wasm exceptions (`guest/sj
   reached by falling through cold code skips the lookup), so short commands pay nothing. Python: startup slightly
   faster (~0.95 s), CPU-bound loops ~4.5× faster, mixed code ~1.8×. `WINIX_NOJIT=1` turns it off,
   `WINIX_JITSTATS=1` prints counts, and `node tests/jitbench.mjs` compares the two.
+  Focused regressions (exact output and exit in each JIT mode): run `scripts/build-jit-fixtures.sh` (WSL/Linux,
+  host gcc; writes `dist/fixtures/` and the pages), serve `dist/` with `node scripts/serve.mjs dist 8000`, then
+  `node tests/jit-indirect.mjs` (memory-operand call/jmp) and `node tests/jit-trace.mjs` (the experimental semantic
+  tier: default, `WINIX_JIT_TRACE=1`, and `WINIX_JIT_TRACE=1 WINIX_JIT_NOTRACE=1`).
 - Bigger caches for a host without linear memory: a 64K-entry instruction cache (Python startup ~30% faster) and a
   4K-entry TLB.
 - configure cannot run its probes when cross-compiling, so `packages/blink.sh` re-enables the features the guest
