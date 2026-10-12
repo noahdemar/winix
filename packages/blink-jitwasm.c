@@ -27,9 +27,13 @@
 #include <unistd.h>
 
 #include "blink/assert.h"
+#include "blink/endian.h"
 #include "blink/jit.h"
 #include "blink/machine.h"
 #include "blink/macros.h"
+#include "blink/modrm.h"
+#include "blink/rde.h"
+#include "blink/x86.h"
 
 const u8 kJitRes[2] = {kJitRes0, kJitRes1};
 const u8 kJitSav[5] = {kJitSav0, kJitSav1, kJitSav2, kJitSav3, kJitSav4};
@@ -75,6 +79,7 @@ static u64 g_sret[2];
 static unsigned g_hot = 3000;  // WINIX_JITHOT: below ~1000 startup costs more than it gains
 static bool g_noinline;      // WINIX_JIT_NOINLINE
 static bool g_nomemfast;     // WINIX_JIT_NOMEMFAST
+static bool g_nostackfast;   // WINIX_JIT_NOSTACKFAST
 static struct {
   long started, abandoned, paths, failed, ops;
   double ms;
@@ -226,6 +231,7 @@ int InitJit(struct Jit *jit, uintptr_t opt_staging_function) {
   if (getenv("WINIX_JITHOT")) g_hot = atoi(getenv("WINIX_JITHOT"));
   g_noinline = !!getenv("WINIX_JIT_NOINLINE");
   g_nomemfast = !!getenv("WINIX_JIT_NOMEMFAST");
+  g_nostackfast = !!getenv("WINIX_JIT_NOSTACKFAST");
   static bool stats;
   if (!stats && getenv("WINIX_JITSTATS")) stats = true, atexit(PrintStats);
   return 0;
@@ -826,10 +832,111 @@ static void EmitReserveFast(struct Buf *b) {
   B1(b, 0x0b);            // end $slow: fall into the real call
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// stack fast paths
+//
+// Blink has micro-ops for 64-bit push, pop, call and ret, but only for linear
+// memory, so here those instructions are generic op calls that go through
+// AccessRam and a page-table walk. Each of these replaces one in its common
+// case: a TLB hit, 8 bytes within one page. They make no calls, so they are
+// inlined, and return nonzero when the real op must run instead.
+// WINIX_JIT_NOSTACKFAST=1 turns them off.
+
+static inline u8 *StackTlb(struct Machine *m, u64 v, u64 need) {
+  struct MachineTlb *e;
+  if ((v & 4095) > 4096 - 8 || m->invalidated || m->metal) return 0;
+  e = m->tlb + ((v >> 12) & (ARRAYLEN(m->tlb) - 1));
+  if (e->page != (v & -4096) || (e->entry & need) != need) return 0;
+  return (u8 *)(uintptr_t)(e->entry & PAGE_TA) + (v & 4095);
+}
+
+#define kStackR (PAGE_V | PAGE_HOST | PAGE_U)
+#define kStackW (PAGE_V | PAGE_HOST | PAGE_U | PAGE_RW)
+
+static inline int StackPush(struct Machine *m, u64 x) {
+  u8 *w;
+  u64 v = Get64(m->sp) - 8;
+  if (!(w = StackTlb(m, v, kStackW))) return 1;
+  Write64(w, x);
+  Put64(m->sp, v);
+  return 0;
+}
+
+static int WinixPush(P) {
+  return StackPush(m, Get64(m->weg[RexbSrm(rde)]));
+}
+
+static int WinixPop(P) {
+  u8 *r;
+  u64 v = Get64(m->sp);
+  if (!(r = StackTlb(m, v, kStackR))) return 1;
+  Put64(m->sp, v + 8);
+  Put64(m->weg[RexbSrm(rde)], Read64(r));
+  return 0;
+}
+
+static int WinixCall(P) {
+  if (StackPush(m, m->ip)) return 1;
+  m->ip += disp;
+  return 0;
+}
+
+static int WinixRet(P) {
+  u8 *r;
+  u64 v = Get64(m->sp);
+  if (!(r = StackTlb(m, v, kStackR))) return 1;
+  Put64(m->sp, v + 8);
+  m->ip = Read64(r);
+  return 0;
+}
+
+// group 0xff with a register operand: call, jmp, push
+static int WinixOp0ff(P) {
+  u64 x = Get64(m->weg[RexbRm(rde)]);
+  switch (ModrmReg(rde)) {
+    case 2:
+      if (StackPush(m, m->ip)) return 1;
+      m->ip = x;
+      return 0;
+    case 4:
+      m->ip = x;
+      return 0;
+    default:
+      return StackPush(m, x);
+  }
+}
+
+// The fast path for a generic op call fn(m, rde, ...), if it has one.
+static uintptr_t StackFastFor(uintptr_t fn, u64 rde) {
+  if (g_nostackfast || Osz(rde) || Mode(rde) != XED_MODE_LONG) return 0;
+  if (fn == (uintptr_t)OpPushZvq) return (uintptr_t)WinixPush;
+  if (fn == (uintptr_t)OpPopZvq) return (uintptr_t)WinixPop;
+  if (fn == (uintptr_t)OpCallJvds) return (uintptr_t)WinixCall;
+  if (fn == (uintptr_t)OpRet) return (uintptr_t)WinixRet;
+  if (fn == (uintptr_t)GetOp(0xff) && IsModrmRegister(rde) &&
+      (ModrmReg(rde) == 2 || ModrmReg(rde) == 4 || ModrmReg(rde) == 6)) {
+    return (uintptr_t)WinixOp0ff;
+  }
+  return 0;
+}
+
 static bool EmitCall(struct Buf *b, uintptr_t fn);
 
-static bool EmitCallMaybeFast(struct Buf *b, uintptr_t fn) {
+// rde: arg1 when it holds a known constant (as for generic op calls), else -1.
+static bool EmitCallMaybeFast(struct Buf *b, uintptr_t fn, i64 rde) {
   bool ok;
+  uintptr_t fast;
+  if (rde != -1 && (fast = StackFastFor(fn, rde))) {
+    // res0 is arg0 (the machine), which the real op still needs
+    GetReg(b, kJitRes0), SetRegFromStack(b, T_VIRT);
+    if (!EmitCall(b, fast)) return false;
+    GetReg(b, kJitRes0), B1(b, 0xa7);
+    GetReg(b, T_VIRT), SetRegFromStack(b, kJitRes0);
+    B1(b, 0x04), B1(b, 0x40);  // nonzero: run the real op
+    ok = EmitCall(b, fn);
+    B1(b, 0x0b);
+    return ok;
+  }
   if (fn != (uintptr_t)ReserveAddress || g_nomemfast) return EmitCall(b, fn);
   EmitReserveFast(b);
   ok = EmitCall(b, fn);
@@ -1021,8 +1128,12 @@ static uintptr_t Compile(long n) {
   BU(&body, kPool), B1(&body, 0x7e);
   BU(&body, kPool), B1(&body, 0x7d);
   BU(&body, kPool), B1(&body, 0x7c);
+  i64 arg1 = -1;  // arg1's value while it holds a constant
   for (i = 0; i < n; ++i) {
     struct Ir *ir = g_ir + i;
+    if ((ir->op == kIrSet || ir->op == kIrMov) && ir->a == kJitArg1) {
+      arg1 = ir->op == kIrSet ? (i64)ir->x : -1;
+    }
     switch (ir->op) {
       case kIrEnter:
         B1(&body, 0x20), BU(&body, 0), B1(&body, 0xad);  // i64.extend_i32_u
@@ -1037,7 +1148,8 @@ static uintptr_t Compile(long n) {
         SetRegFromStack(&body, ir->a);
         break;
       case kIrCall:
-        if (!EmitCallMaybeFast(&body, ir->x)) goto Fail;
+        if (!EmitCallMaybeFast(&body, ir->x, arg1)) goto Fail;
+        if (kJitRes0 == kJitArg1 || kJitRes1 == kJitArg1) arg1 = -1;
         break;
       case kIrStash:
         B1(&body, 0x20), BU(&body, 0);

@@ -12,10 +12,12 @@ PROG=${0##*/}
 mkdir -p "$DB"
 
 die() { echo "E: $*" >&2; exit 100; }
+# curl -sSf with retries: a download through the page's fetch occasionally drops mid-transfer
+get() { curl -sSf "$@" || { sleep 1; curl -sSf "$@"; } || { sleep 2; curl -sSf "$@"; }; }
 
 update() {
 	echo "Get:1 $REPO index.txt"
-	curl -sSf -o "$INDEX.new" "$REPO/index.txt" || die "Failed to fetch $REPO/index.txt"
+	get -o "$INDEX.new" "$REPO/index.txt" || die "Failed to fetch $REPO/index.txt"
 	mv "$INDEX.new" "$INDEX"
 	echo "Reading package lists... Done ($(wc -l < "$INDEX") packages available)"
 }
@@ -43,7 +45,7 @@ install_one() {
 	file=${pkg}_${ver}_$(echo "$sum" | cut -c 1-12).tar.gz
 	tmp=/tmp/apt.$$.tar.gz
 	echo "Get: $REPO/$file [$(field "$pkg" 4) B]"
-	curl -sSf -o "$tmp" "$REPO/$file" || { rm -f "$tmp"; die "Failed to fetch $file"; }
+	get -o "$tmp" "$REPO/$file" || { rm -f "$tmp"; die "Failed to fetch $file"; }
 	[ "$(sha256sum "$tmp" | cut -d ' ' -f 1)" = "$sum" ] || { rm -f "$tmp"; die "Hash sum mismatch for $pkg"; }
 	echo "Unpacking $pkg ($ver) ..."
 	[ -f "$DB/$pkg" ] && remove_files "$pkg"
@@ -81,7 +83,7 @@ x86_update() {
 	: > "$X86INDEX.new"
 	for r in main community; do
 		echo "Get: $ALPINE/$r/x86_64/APKINDEX.tar.gz"
-		curl -sSf -o /tmp/apt.idx/i.tgz "$ALPINE/$r/x86_64/APKINDEX.tar.gz" && tar xzf /tmp/apt.idx/i.tgz -C /tmp/apt.idx APKINDEX ||
+		get -o /tmp/apt.idx/i.tgz "$ALPINE/$r/x86_64/APKINDEX.tar.gz" && tar xzf /tmp/apt.idx/i.tgz -C /tmp/apt.idx APKINDEX ||
 			{ rm -rf /tmp/apt.idx "$X86INDEX.new"; return 1; }
 		awk -v r="$r" '{ print } /^P:/ { print "R:" r }' /tmp/apt.idx/APKINDEX >> "$X86INDEX.new"
 	done
@@ -125,7 +127,7 @@ x86_install() {
 		[ -n "$name" ] || continue
 		apk=/tmp/apt.$$.apk
 		echo "Get: $ALPINE/$repo/x86_64/$name-$ver.apk"
-		curl -sSf -o "$apk" "$ALPINE/$repo/x86_64/$name-$ver.apk" || { rm -f "$apk"; die "Failed to fetch $name-$ver.apk"; }
+		get -o "$apk" "$ALPINE/$repo/x86_64/$name-$ver.apk" || { rm -f "$apk"; die "Failed to fetch $name-$ver.apk"; }
 		echo "Unpacking $name ($ver) [x86-64] ..."
 		tar xzf "$apk" -C "$X86ROOT" 2>/dev/null
 		rm -f "$X86ROOT"/.PKGINFO "$X86ROOT"/.SIGN.* "$X86ROOT"/.pre-* "$X86ROOT"/.post-* "$X86ROOT"/.trigger
