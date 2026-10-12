@@ -79,6 +79,12 @@
   <div id="session-status" class="meta" role="status"></div>
   <footer>Each command runs in a fresh <code>sh</code>; files persist. Full-screen programs (vi, top) need the <a href="terminal.html">terminal</a>.</footer>
 </main>
+<script>
+// Registers the isolation service worker once, then reloads so the page is controlled by it.
+if ('serviceWorker' in navigator && !crossOriginIsolated) {
+  navigator.serviceWorker.register('coi-sw.js').then(() => location.reload()).catch((e) => console.error(e));
+}
+</script>
 <script type="module">
 import { Winix, proxyFetch } from './winix.js';
 

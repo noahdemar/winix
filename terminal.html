@@ -41,6 +41,12 @@
   writers and save editors first. Backups can contain secrets such as .env files and keys.</p>
 <div id="wrap"><div id="terminal"></div></div>
 <script src="xterm.js"></script>
+<script>
+// Registers the isolation service worker once, then reloads so the page is controlled by it.
+if ('serviceWorker' in navigator && !crossOriginIsolated) {
+  navigator.serviceWorker.register('coi-sw.js').then(() => location.reload()).catch((e) => console.error(e));
+}
+</script>
 <script type="module">
   import { Winix, proxyFetch } from './winix.js';
 
