@@ -55,7 +55,8 @@ Packages are built with `setjmp`/`longjmp` lowered to wasm exceptions (`guest/sj
 
 ### Blink on a no-MMU kernel
 
-`packages/blink-wasm.patch` adapts Blink to this host:
+`packages/blink-wasm.patch` adapts Blink to this host (generated from `packages/blink-wasm-patch.py` by
+`packages/blink-wasm-patch.sh`):
 
 - `fork()` is a snapshot: the guest process is plain data in Blink (registers plus its own page tables), so it is
   streamed through a pipe into a freshly exec'd Blink that rebuilds it and resumes with `rax=0`. Host file
@@ -63,6 +64,8 @@ Packages are built with `setjmp`/`longjmp` lowered to wasm exceptions (`guest/sj
 - ELF segments are copied into anonymous memory instead of `mmap`ped per page; host `mprotect`/partial `munmap`
   (unavailable without an MMU) become no-ops, since guest page permissions live in Blink's own page tables.
 - Upstream bug: without threads, `InvalidateSystem` never flushed the TLB, so `mprotect` never took effect.
+- The instruction cache grows from 512 to 65,536 entries (Python startup ~30% faster); an opt-in block compiler
+  (`WINIX_JIT=1`, via a runtime hook that installs generated wasm functions) is scaffolding for a real JIT backend.
 - configure cannot run its probes when cross-compiling, so `packages/blink.sh` re-enables the features the guest
   libc and kernel have (`pipe2`, `dup3`, `wait4`, `preadv`, `getrandom`, ...).
 

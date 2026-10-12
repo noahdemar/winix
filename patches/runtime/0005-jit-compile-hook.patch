@@ -1,0 +1,28 @@
+diff --git a/runtime/linux-worker.js b/runtime/linux-worker.js
+index bcd5617..5cbfac6 100644
+--- a/runtime/linux-worker.js
++++ b/runtime/linux-worker.js
+@@ -453,6 +453,23 @@
+             // Exception tag for programs built with wasm setjmp/longjmp support (thrown and caught within the program).
+             __c_longjmp: new WebAssembly.Tag({ parameters: ['i' + arch_bits] }),
+ 
++            // JIT support: the program hands over a small wasm module (exporting "f", importing env.memory and
++            // env.table); it is compiled synchronously, instantiated against this program's memory and function
++            // table, and appended to the table. Returns the table index, i.e. a C function pointer, or -1.
++            winix_jit_compile: (bytes, length) => {
++              try {
++                const table = user_executable_imports.env.__indirect_function_table;
++                const module = new WebAssembly.Module(new Uint8Array(memory.buffer).slice(bytes, bytes + length));
++                const instance = new WebAssembly.Instance(module, { env: { memory: memory, table: table } });
++                const index = table.grow(1);
++                table.set(index, instance.exports.f);
++                return index;
++              } catch (error) {
++                log("winix_jit_compile: " + error);
++                return -1;
++              }
++            },
++
+             // To be correct, we should save AND restore these globals between the user instance and vmlinux instance:
+             // __stack_pointer <-> __user_stack_pointer
+             // __tls_base <-> __user_tls_base
