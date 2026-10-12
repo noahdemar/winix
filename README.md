@@ -70,10 +70,12 @@ Packages are built with `setjmp`/`longjmp` lowered to wasm exceptions (`guest/sj
   - micro-ops are **inlined**: the page hands over their wasm bodies from Blink's own binary
     (`winix_jit_fnbody`), which are re-encoded into the path (locals renumbered, `return` turned into a branch);
   - other calls are typed `call_indirect`s, with types read from the binary (`winix_jit_fntype`);
+  - guest memory lookups take an inline TLB fast path, and call Blink only on a miss (`WINIX_JIT_NOMEMFAST=1`
+    disables it);
   - paths chain with tail calls, through per-site cache cells, and dispatch in place instead of returning to the
     interpreter; Blink's few raw ARM branch encodings are decoded into wasm conditionals.
   Only code that runs 3,000 times gets a path (`WINIX_JITHOT`), so short commands pay nothing. Python: startup
-  unchanged (~1.1 s), CPU-bound loops ~2.4× faster. `WINIX_NOJIT=1` turns it off, `WINIX_JITSTATS=1` prints counts.
+  unchanged (~1.1 s), CPU-bound loops ~3.4× faster. `WINIX_NOJIT=1` turns it off, `WINIX_JITSTATS=1` prints counts.
 - Bigger caches for a host without linear memory: a 64K-entry instruction cache (Python startup ~30% faster) and a
   4K-entry TLB.
 - configure cannot run its probes when cross-compiling, so `packages/blink.sh` re-enables the features the guest

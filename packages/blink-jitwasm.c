@@ -29,6 +29,7 @@
 #include "blink/assert.h"
 #include "blink/jit.h"
 #include "blink/machine.h"
+#include "blink/macros.h"
 
 const u8 kJitRes[2] = {kJitRes0, kJitRes1};
 const u8 kJitSav[5] = {kJitSav0, kJitSav1, kJitSav2, kJitSav3, kJitSav4};
@@ -73,6 +74,7 @@ static u64 g_sret[2];
 // Building a path costs a module compile, so only hot code gets one.
 static unsigned g_hot = 3000;  // WINIX_JITHOT: below ~1000 startup costs more than it gains
 static bool g_noinline;      // WINIX_JIT_NOINLINE
+static bool g_nomemfast;     // WINIX_JIT_NOMEMFAST
 static struct {
   long started, abandoned, paths, failed, ops;
   double ms;
@@ -223,6 +225,7 @@ int InitJit(struct Jit *jit, uintptr_t opt_staging_function) {
   atomic_store_explicit(&jit->disabled, !!getenv("WINIX_NOJIT"), memory_order_release);
   if (getenv("WINIX_JITHOT")) g_hot = atoi(getenv("WINIX_JITHOT"));
   g_noinline = !!getenv("WINIX_JIT_NOINLINE");
+  g_nomemfast = !!getenv("WINIX_JIT_NOMEMFAST");
   static bool stats;
   if (!stats && getenv("WINIX_JITSTATS")) stats = true, atexit(PrintStats);
   return 0;
@@ -746,6 +749,94 @@ static bool TryInline(struct Buf *b, uintptr_t fn, long long sig) {
   return true;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// inline guest memory translation
+//
+// Without linear memory, every load and store in a path calls
+// ReserveAddress(m, v, n, writable) (memory.c) for a host pointer, through a
+// chain of calls. Its common case is inlined here: a TLB hit on a host-backed
+// page with the right permissions, not crossing a page, no pending TLB flush,
+// not metal mode, and (for writes) not a writable+executable page, which Blink
+// tracks for self-modifying code. Anything else takes the real call.
+// WINIX_JIT_NOMEMFAST=1 turns it off.
+
+
+#define T_ENTRY 24  // register locals Blink's register convention never uses
+#define T_VIRT  25
+
+static void I64Const(struct Buf *b, i64 x) {
+  B1(b, 0x42), BS(b, x);
+}
+
+// Emits the fast path inside `block $done; block $slow`; on success the
+// result is in res0 and control leaves $done. The caller emits the real call
+// (the slow path) and then the two `end`s.
+static void EmitReserveFast(struct Buf *b) {
+  const u32 tlb = offsetof(struct Machine, tlb);
+  B1(b, 0x02), B1(b, 0x40);  // block $done
+  B1(b, 0x02), B1(b, 0x40);  // block $slow
+  GetReg(b, kJitArg1), SetRegFromStack(b, T_VIRT);
+  // pending TLB flush, or metal mode: slow
+  B1(b, 0x20), BU(b, 0), BMem(b, 0x2d, 0, offsetof(struct Machine, invalidated));
+  B1(b, 0x0d), BU(b, 0);
+  B1(b, 0x20), BU(b, 0), BMem(b, 0x2d, 0, offsetof(struct Machine, metal));
+  B1(b, 0x0d), BU(b, 0);
+  // (v & 4095) + n > 4096: crosses a page, slow
+  GetReg(b, T_VIRT), I64Const(b, 4095), B1(b, 0x83);
+  GetReg(b, kJitArg2), B1(b, 0x7c), I64Const(b, 4096), B1(b, 0x56);
+  B1(b, 0x0d), BU(b, 0);
+  // slot = m + ((v >> 12) & (TLB size - 1)) * 16
+  B1(b, 0x20), BU(b, 0);
+  GetReg(b, T_VIRT), I64Const(b, 12), B1(b, 0x88), B1(b, 0xa7);
+  B1(b, 0x41), BS(b, ARRAYLEN(((struct Machine *)0)->tlb) - 1), B1(b, 0x71);
+  B1(b, 0x41), BS(b, 4), B1(b, 0x74), B1(b, 0x6a);
+  B1(b, 0x21), BU(b, LOCAL(32));
+  // slot->page != (v & -4096): miss, slow
+  B1(b, 0x20), BU(b, LOCAL(32)), BMem(b, 0x29, 3, tlb);
+  GetReg(b, T_VIRT), I64Const(b, -4096), B1(b, 0x83), B1(b, 0x52);
+  B1(b, 0x0d), BU(b, 0);
+  // entry must be valid, host-backed and user-accessible
+  B1(b, 0x20), BU(b, LOCAL(32)), BMem(b, 0x29, 3, tlb + 8);
+  SetRegFromStack(b, T_ENTRY);
+  GetReg(b, T_ENTRY), I64Const(b, PAGE_V | PAGE_HOST | PAGE_U), B1(b, 0x83);
+  I64Const(b, PAGE_V | PAGE_HOST | PAGE_U), B1(b, 0x52);
+  B1(b, 0x0d), BU(b, 0);
+  // writes: the page must be writable, and not also executable
+  GetReg(b, kJitArg3), B1(b, 0xa7);
+  B1(b, 0x04), B1(b, 0x40);
+  GetReg(b, T_ENTRY), I64Const(b, PAGE_RW), B1(b, 0x83), B1(b, 0x50);
+  B1(b, 0x0d), BU(b, 1);
+  GetReg(b, T_ENTRY), I64Const(b, PAGE_U | PAGE_RW | PAGE_XD), B1(b, 0x83);
+  I64Const(b, PAGE_U | PAGE_RW), B1(b, 0x51);
+  B1(b, 0x0d), BU(b, 1);
+  // SetWriteAddr
+  B1(b, 0x20), BU(b, 0), GetReg(b, T_VIRT), BMem(b, 0x37, 3, offsetof(struct Machine, writeaddr));
+  B1(b, 0x20), BU(b, 0), GetReg(b, kJitArg2), BMem(b, 0x37, 3, offsetof(struct Machine, writesize));
+  B1(b, 0x05);  // else: SetReadAddr
+  B1(b, 0x20), BU(b, 0), GetReg(b, T_VIRT), BMem(b, 0x37, 3, offsetof(struct Machine, readaddr));
+  B1(b, 0x20), BU(b, 0), GetReg(b, kJitArg2), BMem(b, 0x37, 3, offsetof(struct Machine, readsize));
+  B1(b, 0x0b);
+  // m->reserving = true
+  B1(b, 0x20), BU(b, 0), B1(b, 0x41), BS(b, 1), BMem(b, 0x3a, 0, offsetof(struct Machine, reserving));
+  // res0 = (entry & PAGE_TA) + (v & 4095), as a 32-bit host pointer
+  GetReg(b, T_ENTRY), B1(b, 0xa7), B1(b, 0x41), BS(b, (i32)0xfffff000), B1(b, 0x71);
+  GetReg(b, T_VIRT), B1(b, 0xa7), B1(b, 0x41), BS(b, 4095), B1(b, 0x71), B1(b, 0x6a);
+  B1(b, 0xad), SetRegFromStack(b, kJitRes0);
+  B1(b, 0x0c), BU(b, 1);  // br $done
+  B1(b, 0x0b);            // end $slow: fall into the real call
+}
+
+static bool EmitCall(struct Buf *b, uintptr_t fn);
+
+static bool EmitCallMaybeFast(struct Buf *b, uintptr_t fn) {
+  bool ok;
+  if (fn != (uintptr_t)ReserveAddress || g_nomemfast) return EmitCall(b, fn);
+  EmitReserveFast(b);
+  ok = EmitCall(b, fn);
+  B1(b, 0x0b);  // end $done
+  return ok;
+}
+
 static bool EmitCall(struct Buf *b, uintptr_t fn) {
   long long sig;
   int np, nr, k, first = 0, ti;
@@ -946,7 +1037,7 @@ static uintptr_t Compile(long n) {
         SetRegFromStack(&body, ir->a);
         break;
       case kIrCall:
-        if (!EmitCall(&body, ir->x)) goto Fail;
+        if (!EmitCallMaybeFast(&body, ir->x)) goto Fail;
         break;
       case kIrStash:
         B1(&body, 0x20), BU(&body, 0);
