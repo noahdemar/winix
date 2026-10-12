@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>winix terminal</title>
+<link rel="stylesheet" href="xterm.css">
+<style>
+  :root {
+    --bg: #fbfbfa; --fg: #1c1c1a; --muted: #8a8a85; --line: #e6e5e1;
+    --term-bg: #161615; --term-fg: #e8e7e3;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121211; --fg: #e8e7e3; --muted: #7d7c77; --line: #262624; --term-bg: #1a1a19; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
+  body { font: 13px/1.5 var(--mono); display: flex; flex-direction: column; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; max-width: 900px; width: 100%; margin: 0 auto; padding: 20px 16px 12px; }
+  header a { color: inherit; text-decoration: none; font-weight: 600; }
+  header #status { color: var(--muted); min-width: 0; overflow-wrap: anywhere; }
+  header nav { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+  header nav button { font: 12.5px var(--mono); color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; cursor: pointer; }
+  header nav button:disabled { opacity: .5; cursor: default; }
+  #note { max-width: 900px; width: 100%; margin: 0 auto; padding: 0 16px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  #wrap { flex: 1; min-height: 0; max-width: 900px; width: 100%; margin: 8px auto 16px; padding: 0 16px; }
+  #terminal { height: 100%; background: var(--term-bg); border: 1px solid var(--line); border-radius: 10px; padding: 12px 6px 12px 14px; overflow: hidden; }
+  .xterm .xterm-viewport { background: transparent !important; scrollbar-width: thin; scrollbar-color: #3a3a38 transparent; }
+</style>
+<header>
+  <a href="./">winix</a>
+  <span id="status">booting…</span>
+  <nav>
+    <button id="save" type="button" disabled>Save Session</button>
+    <button id="load" type="button" disabled>Load Session</button>
+    <input id="loadfile" type="file" accept=".winix" hidden>
+  </nav>
+</header>
+<p id="note">Session saves keep files only: not running programs, shell state, terminal screen or editor buffers. Stop background
+  writers and save editors first. Backups can contain secrets such as .env files and keys.</p>
+<div id="wrap"><div id="terminal"></div></div>
+<script src="xterm.js"></script>
+<script type="module">
+  import { Winix, proxyFetch } from './winix.js';
+
+  const css = getComputedStyle(document.documentElement);
+  const term = new Terminal({
+    fontFamily: css.getPropertyValue('--mono'),
+    fontSize: 13.5,
+    cursorBlink: true,
+    theme: { background: css.getPropertyValue('--term-bg').trim(), foreground: css.getPropertyValue('--term-fg').trim(),
+      cursor: '#7cc59b', selectionBackground: '#3a4a40' },
+  });
+  term.open(document.getElementById('terminal'));
+
+  // Fit rows/columns to the panel (xterm's fit addon, inlined: cell size comes from the renderer).
+  const fit = () => {
+    const cell = term._core?._renderService?.dimensions?.css?.cell;
+    const el = document.getElementById('terminal');
+    if (!cell?.width) return;
+    const cs = getComputedStyle(el);
+    const w = el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - 14; // scrollbar
+    const h = el.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+    term.resize(Math.max(20, Math.floor(w / cell.width)), Math.max(5, Math.floor(h / cell.height)));
+  };
+  fit();
+  addEventListener('resize', fit);
+
+  const $ = (id) => document.getElementById(id);
+  const status = $('status');
+  const log = (text) => term.write(('\x1b[2m' + text + '\x1b[0m\n').replaceAll('\n', '\r\n'));
+  const PROMPT = /# $/;
+
+  // Console output of one machine. While `buf` is set (a machine being restored) output is held back and nothing is
+  // typed into it; once it is the current machine, output goes straight to the terminal. The terminal size is sent
+  // after the first prompt of the current machine, so it is never typed in during a restore.
+  const consoleFor = (inst) => (data) => {
+    if (inst.gone) return;
+    if (inst.buf) {
+      inst.buf.push(data);
+      return;
+    }
+    term.write(data);
+    if (PROMPT.test(data)) inst.prompted = true;
+    sendSize(inst);
+  };
+  const sendSize = (inst) => {
+    if (inst.sized || !inst.prompted || !inst.w || inst.buf || inst.gone) return;
+    inst.sized = true;
+    try {
+      inst.w.keyInput(`stty cols ${term.cols} rows ${term.rows}; clear\n`);
+    } catch {}
+  };
+
+  let cur = null; // { w, buf, prompted, sized, gone } for the machine the terminal shows
+  let busy = false;
+  const setBusy = (on) => {
+    busy = on;
+    $('save').disabled = $('load').disabled = on || !cur;
+  };
+  const newInst = (buf) => ({ w: null, buf, prompted: false, sized: false, gone: false });
+
+  try {
+    if (!crossOriginIsolated) throw new Error('page is not cross-origin isolated (COOP/COEP headers missing)');
+    const first = newInst(null);
+    const t0 = performance.now();
+    first.w = await Winix.boot({ onConsole: consoleFor(first), onLog: log, fetch: proxyFetch() });
+    cur = first;
+    status.textContent = `ready · ${Math.round(performance.now() - t0)} ms`;
+    sendSize(first);
+  } catch (e) {
+    status.textContent = 'failed';
+    log('boot failed: ' + e.message);
+  }
+  setBusy(false);
+  term.onData((data) => {
+    if (busy || !cur?.w) return;
+    try {
+      cur.w.keyInput(data);
+    } catch {}
+  });
+  term.focus();
+
+  $('save').onclick = async () => {
+    if (busy || !cur) return;
+    setBusy(true);
+    status.textContent = 'saving…';
+    try {
+      const blob = await cur.w.exportSession({
+        hostState: { ui: { kind: 'terminal' } },
+        onProgress: (p) => { status.textContent = `saving… ${p.filesDone}/${p.filesTotal} files`; },
+      });
+      const url = URL.createObjectURL(blob);
+      const a = Object.assign(document.createElement('a'), { href: url, download: `winix-session-${new Date().toISOString().replace(/[:.]/g, '-')}.winix` });
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      status.textContent = `saved ${Math.round(blob.size / 1024)} KiB`;
+    } catch (e) {
+      status.textContent = 'save failed: ' + e.message;
+    }
+    setBusy(false);
+    term.focus();
+  };
+  $('load').onclick = () => { if (!busy && cur) $('loadfile').click(); };
+  $('loadfile').onchange = async () => {
+    const file = $('loadfile').files[0];
+    $('loadfile').value = '';
+    if (!file || busy || !cur) return;
+    const ok = confirm('Load this session? It replaces the terminal\'s filesystem; the current machine is closed, and ' +
+      'unsaved work in it is lost. Load only backups you trust: they can contain files such as .env or keys.');
+    if (!ok) return;
+    setBusy(true);
+    status.textContent = 'loading…';
+    const inst = newInst([]);
+    let next;
+    try {
+      next = await Winix.restoreSession(file, {
+        onConsole: consoleFor(inst),
+        onLog: log,
+        fetch: proxyFetch(),
+        onProgress: (p) => { status.textContent = `${p.phase} ${p.filesDone}/${p.filesTotal} files`; },
+      });
+    } catch (e) {
+      status.textContent = 'load failed, current session kept: ' + e.message;
+      setBusy(false);
+      term.focus();
+      return;
+    }
+    const old = cur;
+    old.gone = true;
+    inst.w = next;
+    const pending = inst.buf.join('');
+    inst.buf = null;
+    cur = inst;
+    old.w.dispose();
+    term.reset();
+    term.write(pending);
+    inst.prompted = PROMPT.test(pending) || inst.prompted;
+    sendSize(inst);
+    status.textContent = `session restored from ${file.name}`;
+    setBusy(false);
+    term.focus();
+  };
+</script>
+</html>

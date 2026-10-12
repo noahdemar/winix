@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>winix jit-trace</title>
+<pre id="out"></pre>
+<script type="module">
+import { Winix } from './winix.js';
+
+const out = document.getElementById('out');
+const results = (window.__results = { modes: {}, error: null });
+const log = (s) => { out.textContent += s + '\n'; };
+
+const EXPECTED = 'zext 0x89ab4255\nchain 0xcd140\nwrap 0x0 0x55\novf 0x8000000000000000 0x894\n' +
+  'borrow 0xffffffffffffffff 0x95\ndeadlive 0xf 0x44\ncarry 0xd\nmem 0x2a\ncall 0x10\nbranch 0x2a\n' +
+  'nimm 0xfffffffffffffffa\nflagbarrier 0x0 0x55\n';
+const MODE_TIMEOUT_MS = 120000;
+const MODES = {
+  nojit: 'WINIX_NOJIT=1 WINIX_JITSTATS=1',
+  trace: 'WINIX_JITHOT=1 WINIX_JIT_BATCH=1 WINIX_JITSTATS=1',
+  notrace: 'WINIX_JITHOT=1 WINIX_JIT_BATCH=1 WINIX_JIT_NOTRACE=1 WINIX_JITSTATS=1',
+};
+
+let w = null;
+try {
+  w = await Winix.boot();
+  log('booted');
+  const res = await fetch('fixtures/jit-trace.bin');
+  if (!res.ok) throw new Error('fetching fixtures/jit-trace.bin: HTTP ' + res.status);
+  await w.writeFile('/work/jt', new Uint8Array(await res.arrayBuffer()));
+  const inst = await w.exec('apt install blink', { timeoutMs: MODE_TIMEOUT_MS });
+  results.install = { exitCode: inst.exitCode, timedOut: inst.timedOut, stderr: inst.stderr.slice(-300) };
+  log('apt install blink: exit ' + inst.exitCode);
+  await w.exec('chmod +x /work/jt');
+  for (const [name, env] of Object.entries(MODES)) {
+    const r = await w.exec(`${env} blink /work/jt`, { timeoutMs: MODE_TIMEOUT_MS });
+    const stat = /\[blink wasm jit\][^\n]*/.exec(r.stderr)?.[0] ?? '';
+    const num = (k) => { const m = new RegExp(k + '=(\\d+)').exec(stat); return m ? Number(m[1]) : null; };
+    results.modes[name] = {
+      stdoutOk: r.stdout === EXPECTED,
+      stdout: r.stdout,
+      exitCode: r.exitCode,
+      timedOut: r.timedOut,
+      truncated: r.truncated,
+      stat,
+      paths: num('paths'),
+      failed: num('failed'),
+      traceOps: num('trace_ops'),
+      traceRegions: num('trace_regions'),
+      flagElided: num('flag_elided'),
+      stderr: r.stderr.replace(/\[blink wasm jit\][^\n]*\n?/g, '').slice(0, 400),
+    };
+    log(`${name}: exit ${r.exitCode} stdoutOk=${r.stdout === EXPECTED} ${stat}`);
+  }
+} catch (e) {
+  results.error = String(e.message || e);
+  log('ERROR ' + results.error);
+} finally {
+  w?.dispose();
+  window.__done = true;
+}
+</script>

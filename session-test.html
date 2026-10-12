@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>winix session tests</title>
+<pre id="out"></pre>
+<script type="module">
+// Session save/restore checks for tests/session.mjs. One machine is booted for the round trip; the rejection cases build
+// crafted archives and must fail before any machine starts (no iframe may appear).
+import { Winix } from './winix.js';
+import { LIMITS, encodeArchive } from './session.js';
+
+const out = document.getElementById('out');
+const results = (window.__results = { cases: [], done: false });
+const log = (s) => { out.textContent += s + '\n'; };
+const enc = new TextEncoder();
+const hexOf = (b) => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+const sha = async (b) => new Uint8Array(await crypto.subtle.digest('SHA-256', b));
+const u32 = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); return b; };
+const frames = () => document.querySelectorAll('iframe').length;
+
+async function step(name, fn) {
+  try {
+    const detail = await fn();
+    results.cases.push({ name, ok: true, detail: detail ?? '' });
+  } catch (e) {
+    results.cases.push({ name, ok: false, detail: String(e?.message ?? e) });
+  }
+  log(`${results.cases.at(-1).ok ? 'PASS' : 'FAIL'}  ${name}${results.cases.at(-1).ok ? '' : '  ' + results.cases.at(-1).detail}`);
+}
+const check = (cond, msg) => { if (!cond) throw new Error(msg); };
+const eq = (a, b, msg) => check(JSON.stringify(a) === JSON.stringify(b), `${msg}: expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);
+
+// A raw (possibly malformed) archive: magic | u32 len | sha | manifest | payload, gzip-compressed.
+async function rawArchive({ magic = 'WINIXS01', manifestText, manifestSha, payload = new Uint8Array(0), trailing }) {
+  const mb = enc.encode(manifestText);
+  const parts = [enc.encode(magic), u32(mb.length), manifestSha ?? (await sha(mb)), mb, payload];
+  if (trailing) parts.push(trailing);
+  return new Response(new Blob(parts).stream().pipeThrough(new CompressionStream('gzip'))).blob();
+}
+const manifestOf = (entries, extra = {}) => JSON.stringify({
+  format: 'winix-session', version: 1, kind: 'filesystem', createdAt: '2026-01-01T00:00:00.000Z', variant: 'wasm32_nommu',
+  build: { kernelSha256: 'ab'.repeat(32), initrdSha256: 'ab'.repeat(32) }, hostState: null, entries, omitted: [], ...extra,
+});
+const dirE = (path) => ({ path, type: 'dir', mode: 0o755, uid: 0, gid: 0, mtimeSec: '0', mtimeNsec: 0 });
+const meta = { mode: 0o644, uid: 0, gid: 0, mtimeSec: '0', mtimeNsec: 0 };
+const fileE = async (path, bytes) => ({ path, type: 'file', ...meta, size: bytes.length, chunkHashes: [hexOf(await sha(bytes))] });
+const linkE = (path, target) => ({ path, type: 'symlink', target, ...meta });
+const hardE = (path, target) => ({ path, type: 'hardlink', target, ...meta });
+
+async function expectRejected(name, blobPromise, pattern, { noFrames = true } = {}) {
+  await step(name, async () => {
+    const before = frames();
+    let blob;
+    try {
+      blob = await blobPromise;
+    } catch (e) {
+      throw new Error('could not build the test archive: ' + e.message);
+    }
+    try {
+      await Winix.restoreSession(blob);
+    } catch (e) {
+      check(pattern.test(e.message), `wrong error: ${e.message}`);
+      if (noFrames) check(frames() === before, 'a machine was booted for an invalid session');
+      return e.message;
+    }
+    throw new Error('restore accepted an invalid session');
+  });
+}
+
+// ---- the round trip: one machine, one export, one restore ----
+let w, w2, blob;
+const hs = { task: { n: 1, list: ['a', 'b'] }, history: ['echo hi'] };
+await step('boot and build the fixture filesystem', async () => {
+  w = await Winix.boot();
+  await w.writeFile('/work/héllo ✓.txt', 'héllo ✓\n');
+  await w.writeFile('/work/bin.dat', Uint8Array.from({ length: 1024 }, (_, i) => i & 255));
+  await w.writeFile('/work/empty', '');
+  await w.exec('mkdir -p /work/emptydir');
+  await w.writeFile('/work/a/b/c.txt', 'nested\n');
+  await w.writeFile('/work/run.sh', '#!/bin/sh\necho ran\n', { mode: 0o755 });
+  await w.exec('ln -s ../work/a/b/c.txt /work/ln && ln /work/a/b/c.txt /work/hl && touch -t 202311141200.00 /work/a/b/c.txt');
+  await w.writeFile('/topdir/x/y.txt', 'top');
+  const r = await w.exec('stat -c %Y /work/a/b/c.txt; stat -c %i /work/a/b/c.txt /work/hl');
+  check(r.exitCode === 0, 'stat failed: ' + r.stderr);
+  return r.stdout.trim().replace(/\n/g, ' ');
+});
+await step('install sqlite from the local repository and create a database', async () => {
+  const inst = await w.exec('apt-get install -y sqlite', { timeoutMs: 300000 });
+  check(inst.exitCode === 0 && !inst.timedOut,
+    `apt install failed: exit ${inst.exitCode}, timedOut ${inst.timedOut}, out ${JSON.stringify(inst.stdout.slice(-300))}, err ${JSON.stringify(inst.stderr.slice(-200))}`);
+  const db = await w.exec('sqlite3 /work/db.sqlite "create table t(v); insert into t values (1),(2),(3);" && sqlite3 /work/db.sqlite "select sum(v) from t"');
+  eq(db.stdout, '6\n', 'sum before save');
+  return 'installed';
+});
+await step('save: /bin/echo removed first, writes queued around the export', async () => {
+  await w.exec('rm -f /bin/echo');
+  await w.writeFile('/work/before.txt', 'B');
+  const pExport = w.exportSession({ hostState: hs });
+  const pAfter = w.writeFile('/work/after.txt', 'A');
+  blob = await pExport;
+  await pAfter;
+  check(blob instanceof Blob && blob.size > 0, 'export did not return a Blob');
+  return `${blob.size} bytes`;
+});
+await step('original machine still works after the save', async () => {
+  const r = await w.exec('echo alive');
+  eq(r.stdout, 'alive\n', 'echo');
+});
+await step('restore into a new machine: files, modes, links, mtime, hostState', async () => {
+  w2 = await Winix.restoreSession(blob);
+  eq(await w2.readFile('/work/héllo ✓.txt', { encoding: 'utf8' }), 'héllo ✓\n', 'unicode file');
+  const bin = await w2.readFile('/work/bin.dat');
+  check(bin.length === 1024 && bin.every((v, i) => v === (i & 255)), 'binary contents differ');
+  eq((await w2.readFile('/work/empty')).length, 0, 'empty file length');
+  eq((await w2.exec('test -d /work/emptydir && echo yes')).stdout, 'yes\n', 'empty dir');
+  eq(await w2.readFile('/work/a/b/c.txt', { encoding: 'utf8' }), 'nested\n', 'nested file');
+  eq((await w2.exec('stat -c %a /work/run.sh; sh /work/run.sh')).stdout, '755\nran\n', 'mode and execution');
+  eq((await w2.exec('readlink /work/ln; cat /work/ln')).stdout, '../work/a/b/c.txt\nnested\n', 'symlink');
+  const ino = (await w2.exec('stat -c %i /work/hl /work/a/b/c.txt')).stdout.trim().split('\n');
+  check(ino.length === 2 && ino[0] === ino[1], 'hard link does not share the inode');
+  eq((await w2.exec('stat -c %Y /work/a/b/c.txt')).stdout, (await w.exec('stat -c %Y /work/a/b/c.txt')).stdout, 'mtime');
+  eq(await w2.readFile('/topdir/x/y.txt', { encoding: 'utf8' }), 'top', 'top-level directory');
+  eq(await w2.readFile('/work/before.txt', { encoding: 'utf8' }), 'B', 'write queued before the save');
+  let gone = false;
+  try { await w2.readFile('/work/after.txt'); } catch { gone = true; }
+  check(gone, 'write queued after the save was included');
+  eq((await w2.exec('test -e /bin/echo; echo $?; sh -c "echo hi"')).stdout, '1\nhi\n', 'removed baseline path stays removed');
+  eq(JSON.stringify(w2.hostState), JSON.stringify(hs), 'hostState');
+  const copy = w2.hostState;
+  copy.task.n = 99;
+  eq(w2.hostState.task.n, 1, 'hostState getter returns a copy');
+  return 'ok';
+});
+await step('restored sqlite package and database', async () => {
+  eq((await w2.exec('sqlite3 /work/db.sqlite "select sum(v) from t"')).stdout, '6\n', 'sum after restore');
+  eq((await w2.exec('test -f /var/lib/apt/installed/sqlite && echo rec; command -v sqlite3')).stdout.split('\n')[0], 'rec', 'apt record');
+  eq((await w2.exec('sqlite3 --version >/dev/null && echo ok')).stdout, 'ok\n', 'binary runs');
+  return 'ok';
+});
+await step('restored instance and the original are independent', async () => {
+  eq(await w.readFile('/work/after.txt', { encoding: 'utf8' }), 'A', 'original keeps its own files');
+  w2.dispose();
+  eq((await w.exec('echo still')).stdout, 'still\n', 'disposing the restored instance leaves the original');
+});
+
+// ---- a failure in the middle of a restore: the new machine is disposed, the old one is untouched ----
+await step('forced mid-restore failure disposes the new machine and keeps the old one', async () => {
+  const pre = new Set(document.querySelectorAll('iframe'));
+  const framesBefore = frames();
+  let injected = false;
+  let rejected = null;
+  try {
+    await Winix.restoreSession(blob, {
+      onProgress: (p) => {
+        if (p.phase !== 'restore' || injected) return;
+        injected = true;
+        const f = [...document.querySelectorAll('iframe')].find((x) => !pre.has(x));
+        check(f, 'the new machine iframe was not found');
+        f.contentWindow.eval("parent.postMessage({ winix: 'error', message: 'injected restore failure' }, '*')");
+      },
+    });
+  } catch (e) {
+    rejected = e.message;
+  }
+  check(injected, 'the restore never reached its file phase');
+  check(rejected && /injected restore failure/.test(rejected), `restore did not fail as injected: ${rejected}`);
+  check(frames() === framesBefore, 'the failed machine was not disposed');
+  eq((await w.exec('echo still-here')).stdout, 'still-here\n', 'original machine after the failed restore');
+  eq(await w.readFile('/work/after.txt', { encoding: 'utf8' }), 'A', 'original files after the failed restore');
+  return rejected;
+});
+
+// ---- hostState and export validation (no machine is restored) ----
+await step('invalid hostState is rejected by export, clearly', async () => {
+  const cyc = { x: 1 };
+  cyc.self = cyc;
+  let msgs = [];
+  const accessor = {};
+  Object.defineProperty(accessor, 'g', { get() { return 1; }, enumerable: true });
+  for (const bad of [cyc, { a: undefined }, { n: Infinity }, { d: new Date(0) }, { f() {} }, { big: 1n },
+    { [Symbol('s')]: 1 }, accessor, Object.assign([1], { x: 1 }), [1, , 2]]) {
+    try {
+      await w.exportSession({ hostState: bad });
+      msgs.push('accepted');
+    } catch (e) {
+      msgs.push(e.message);
+    }
+  }
+  check(msgs.every((m) => m !== 'accepted'), 'an invalid hostState was accepted');
+  return msgs.map((m) => m.slice(0, 40)).join(' | ');
+});
+
+// ---- rejection before any machine boots ----
+const good = await rawArchive({ manifestText: manifestOf([dirE('/')]) });
+await expectRejected('bad magic', rawArchive({ magic: 'WINIXX01', manifestText: manifestOf([dirE('/')]) }), /bad magic/);
+await expectRejected('bad version', rawArchive({ manifestText: manifestOf([dirE('/')], { version: 2 }) }), /not a winix filesystem session/);
+await expectRejected('truncated gzip', good.arrayBuffer().then((b) => new Blob([b.slice(0, b.byteLength >> 1)])), /corrupt|truncated|expands/);
+await expectRejected('tampered manifest (checksum)', rawArchive({
+  manifestText: manifestOf([dirE('/'), dirE('/work')]), manifestSha: await sha(enc.encode(manifestOf([dirE('/')]))),
+}), /manifest checksum mismatch/);
+await expectRejected('tampered file chunk (checksum)', rawArchive({
+  manifestText: manifestOf([dirE('/'), { ...(await fileE('/x', new Uint8Array([1, 2, 3]))) }]),
+  payload: new Uint8Array([1, 2, 4]),
+}), /checksum mismatch in chunk 0/);
+await expectRejected('trailing bytes after the payload', rawArchive({
+  manifestText: manifestOf([dirE('/'), await fileE('/x', new Uint8Array([1]))]), payload: new Uint8Array([1]),
+  trailing: new Uint8Array([9]),
+}), /does not match the manifest/);
+await expectRejected('duplicate path', rawArchive({ manifestText: manifestOf([dirE('/'), dirE('/a'), dirE('/a')]) }), /duplicate path/);
+await expectRejected('traversal path', rawArchive({
+  manifestText: manifestOf([dirE('/'), await fileE('/work/../etc/passwd', new Uint8Array([0]))]), payload: new Uint8Array([0]),
+}), /invalid component/);
+await expectRejected('excluded tree', rawArchive({ manifestText: manifestOf([dirE('/'), dirE('/proc')]) }), /outside the session/);
+await expectRejected('symlink ancestor escape', rawArchive({
+  manifestText: manifestOf([dirE('/'), dirE('/work'), linkE('/work/link', '/'),
+    await fileE('/work/link/x', new Uint8Array([1]))]),
+  payload: new Uint8Array([1]),
+}), /no directory parent/);
+await expectRejected('hard link to a missing file', rawArchive({
+  manifestText: manifestOf([dirE('/'), hardE('/hl', '/nope')]),
+}), /not a regular file/);
+await expectRejected('hard link cycle', rawArchive({
+  manifestText: manifestOf([dirE('/'), hardE('/a', '/b'), hardE('/b', '/a')]),
+}), /not a regular file/);
+await expectRejected('excessive declared size', rawArchive({
+  manifestText: manifestOf([dirE('/'), { path: '/huge', type: 'file', ...meta, size: 2 ** 40, chunkHashes: [] }]),
+}), /bad size/);
+await expectRejected('too many entries', rawArchive({
+  manifestText: manifestOf([dirE('/'), ...Array.from({ length: 100001 }, (_, i) => dirE('/d' + i))]),
+}), /bad entry list/);
+await expectRejected('different winix build', rawArchive({ manifestText: manifestOf([dirE('/')]) }), /different winix build/, {});
+await expectRejected('different variant', rawArchive({
+  manifestText: manifestOf([dirE('/')], { variant: 'wasm64_nommu' }),
+}), /this session is for wasm64_nommu/);
+await expectRejected('lone surrogate in an entry path', rawArchive({
+  manifestText: manifestOf([dirE('/'), dirE('/work'), { ...dirE('/work/\ud800') }]),
+}), /not well-formed/);
+await expectRejected('lone surrogate in a link target', rawArchive({
+  manifestText: manifestOf([dirE('/'), dirE('/work'), linkE('/work/l', '/\ud800')]),
+}), /not well-formed/);
+await expectRejected('invalid mode', rawArchive({
+  manifestText: manifestOf([dirE('/'), { ...dirE('/work'), mode: 0o10000 }]),
+}), /bad mode/);
+await expectRejected('invalid uid', rawArchive({
+  manifestText: manifestOf([dirE('/'), { ...dirE('/work'), uid: 4294967295 }]),
+}), /bad uid/);
+await expectRejected('invalid mtime nanoseconds', rawArchive({
+  manifestText: manifestOf([dirE('/'), { ...dirE('/work'), mtimeNsec: 1000000000 }]),
+}), /bad mtime nsec/);
+await step('compressed output over the limit is refused by export (codec level)', async () => {
+  const manifest = JSON.parse(manifestOf([dirE('/')]));
+  const saved = LIMITS.archive;
+  let msg = null;
+  try {
+    LIMITS.archive = 64;
+    await encodeArchive(manifest, []);
+  } catch (e) {
+    msg = e.message;
+  } finally {
+    LIMITS.archive = saved;
+  }
+  check(msg && /larger than 512 MiB compressed/.test(msg), `no limit error: ${msg}`);
+  return msg;
+});
+await step('original machine works after all rejections', async () => {
+  eq((await w.exec('echo still-alive')).stdout, 'still-alive\n', 'echo');
+});
+w.dispose();
+results.done = true;
+log('done');
+window.__done = true;
+</script>
