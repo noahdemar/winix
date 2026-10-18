@@ -46,8 +46,18 @@ await w.exec('wget -q -O - http://example.com/ | head -c 100');
   connecting to one connects to the name it stands for, so the WISP server does the real lookup.
 - WISP does not acknowledge connections, so `connect()` succeeds at once and a refused or unreachable connection shows
   up as the error of the first `recv()` (and in `poll()` and `SO_ERROR`). BusyBox `nc` treats that as a normal exit.
-- No `listen`/`accept` (EOPNOTSUPP), no loopback between guest programs over AF_INET (use AF_UNIX), no IPv6, no TCP
-  half-close (`shutdown(SHUT_WR)` sends nothing). BusyBox `nc` and `wget` (HTTP only) are enabled.
+- Guest programs can `listen` and `accept`. Connections to a listening port on `127.x`, `0.0.0.0` or the guest's
+  `10.0.2.15` are paired in the page; `localhost` resolves to `127.0.0.1`. A `127.x` port with no guest listener goes
+  to the WISP server, which reaches its own machine's localhost.
+- The page can connect in (port forwarding): `w.connect(port)` gives a raw stream, and `w.guestFetch(port, path)`
+  sends an HTTP request to a guest server and resolves to a `Response`:
+
+  ```js
+  await w.exec('python3 -m http.server 8080 >/tmp/log 2>&1 &');
+  const res = await w.guestFetch(8080, '/');
+  ```
+- No IPv6. Over WISP there is no TCP half-close (`shutdown(SHUT_WR)` sends nothing); between guest sockets and to the
+  page it works. BusyBox `nc` and `wget` (HTTP only) are enabled.
 - Without `net`, connections fail with ENETUNREACH. `/__wisp` makes connections for anyone who can reach it, so in
   production point `wisp()` at your own server and restrict it.
 

@@ -164,14 +164,33 @@ await w.exec('printf "HEAD / HTTP/1.0
       connects to the name it stands for, and the WISP server does the real lookup.</li>
     <li>WISP does not confirm connections, so <code>connect()</code> succeeds at once. A refused or unreachable host
       shows up as the error of the first <code>recv()</code>, in <code>poll()</code>, and in <code>SO_ERROR</code>.</li>
-    <li>Only outgoing connections: <code>listen()</code> fails with <code>EOPNOTSUPP</code>, and guest programs cannot
-      reach each other over <code>127.0.0.1</code> (use AF_UNIX). No IPv6, and <code>shutdown(SHUT_WR)</code> sends
-      nothing to the peer.</li>
+    <li>Guest programs can <code>listen()</code> and <code>accept()</code>. Connections to a listening port on
+      <code>127.x</code>, <code>0.0.0.0</code> or the guest's own <code>10.0.2.15</code> are paired in the page, and
+      <code>localhost</code> resolves to <code>127.0.0.1</code>. A <code>127.x</code> port that no guest program listens
+      on goes to the WISP server, which reaches its own machine's localhost.</li>
+    <li>No IPv6. Over WISP, <code>shutdown(SHUT_WR)</code> sends nothing to the peer; between guest sockets, and to the
+      page, it works.</li>
     <li>BusyBox <code>nc</code> and <code>wget</code> (HTTP only) are included. For HTTPS, use <code>curl</code>, which
       goes through <code>fetch</code>.</li>
     <li>A WISP server connects anywhere for anyone who can reach it. In production, run your own, restrict the hosts and
       ports it allows, and pass its URL: <code>wisp('wss://relay.example/')</code>.</li>
   </ul>
+
+  <h3 id="forwarding">Port forwarding</h3>
+  <p>The page can connect to a port a guest program listens on. Neither call waits for queued <code>exec</code> calls.</p>
+  <pre><code>await w.exec('python3 -m http.server 8080 &gt;/tmp/log 2&gt;&amp;1 &amp;');
+const res = await w.guestFetch(8080, '/index.html');   // a standard Response
+console.log(res.status, await res.text());
+
+const c = w.connect(6379);                             // a raw TCP stream
+c.write('PING
+');
+const { value } = await c.readable.getReader().read();</code></pre>
+  <table>
+    <tr><th>Method</th><th>Meaning</th></tr>
+    <tr><td><code>connect(port)</code></td><td>Returns <code>{ readable, write(data), shutdown(), close() }</code>: <code>readable</code> is a <code>ReadableStream</code> of <code>Uint8Array</code>, <code>write</code> takes a string or bytes, <code>shutdown()</code> makes the guest read EOF while it can still answer. Throws an error with <code>errno</code> 111 if nothing listens on the port.</td></tr>
+    <tr><td><code>guestFetch(port, path, options)</code></td><td>Sends one HTTP/1.1 request (<code>Connection: close</code>) and resolves to a <code>Response</code>. Options: <code>method</code>, <code>headers</code> (object), <code>body</code> (string or bytes), <code>timeoutMs</code> (default 30000).</td></tr>
+  </table>
 
   <h2 id="curl">curl</h2>
   <p>Inside the guest, <code>curl</code> performs HTTP and HTTPS requests through the <code>fetch</code> function above.
@@ -200,6 +219,6 @@ await w.exec('printf "HEAD / HTTP/1.0
     only archives you trust. Nothing in the archive runs as code: it is validated before any machine starts.</p>
 
   <h2 id="not-yet">Not yet</h2>
-  <p>These are planned but not part of this release: listening sockets and loopback between guest programs,
-    <code>w.connect()</code>, and <code>w.ping()</code>.</p>
+  <p>These are planned but not part of this release: TLS in the guest's own programs (Python <code>ssl</code>,
+    <code>wget https</code>), and <code>w.ping()</code>.</p>
 </main>

@@ -2,17 +2,34 @@
 // through a transport, normally wisp(url): a WebSocket to a WISP server that makes the real connections. DNS queries
 // (UDP port 53, to any address) are answered here with stand-in addresses from 198.18.0.0/15; connecting to one of them
 // connects to the name it stands for, so the WISP server does the real lookup.
+//
+// Listening sockets are registered here by port. A guest socket connecting to that port on a local address (127.x,
+// 0.0.0.0, or the guest's own 10.0.2.15) is paired with a new socket the listener accepts, and the page can open such
+// connections too (GuestNet.connectToGuest, used by Winix.connect). Other 127.x connections go to the transport.
 
 export const SOCK_BIT = 0x40000000;
+const HOST_ID_BIT = 0x20000000; // with SOCK_BIT: channels made here for accepted sockets (the kernel's ids stay below)
 
-const ENETUNREACH = 101;
+const ENETUNREACH = 101, ECONNREFUSED = 111, EADDRINUSE = 98;
+const GUEST_ADDR = [10, 0, 2, 15], PAGE_ADDR = [10, 0, 2, 2];
 /// errno for a WISP close reason, when a TCP stream closes before the peer sent anything.
 const CLOSE_ERRNO = { 0x02: 0, 0x03: 104 /* ECONNRESET */, 0x41: 22 /* EINVAL */, 0x42: 113 /* EHOSTUNREACH */,
   0x43: 110 /* ETIMEDOUT */, 0x44: 111 /* ECONNREFUSED */, 0x47: 111, 0x48: 111 };
-const K = { CONNECT: 1, DATA: 2, UDP: 3, SHUTDOWN: 4 };
+const K = { CONNECT: 1, DATA: 2, UDP: 3, SHUTDOWN: 4, LISTEN: 5 };
 
 const le32 = (v) => new Uint8Array(new Uint32Array([v >>> 0]).buffer);
 const ipString = (b, o) => `${b[o]}.${b[o + 1]}.${b[o + 2]}.${b[o + 3]}`;
+/// The port the kernel reports for a socket that was never bound (winixnet.c: ws_local_port).
+const ephemeralPort = (id) => 32768 + (id & 0x3fff);
+/// An accept record: le32 channel id, be32 peer addr, be16 peer port.
+const acceptRecord = (id, addr, port) => {
+  const out = new Uint8Array(10);
+  out.set(le32(id), 0);
+  out.set(addr, 4);
+  out[8] = port >> 8;
+  out[9] = port & 255;
+  return out;
+};
 
 /// Stand-in DNS: names get addresses in 198.18.0.0/15 (reserved for benchmarking, never routed), assigned in order.
 class FakeDns {
@@ -58,7 +75,8 @@ class FakeDns {
     const qtype = dv.getUint16(o), qclass = dv.getUint16(o + 2);
     const question = q.subarray(12, o + 4);
     const name = labels.join('.');
-    const a = qtype === 1 && qclass === 1 && name ? this.addrFor(name) : null;
+    const isLocal = /(^|\.)localhost\.?$/i.test(name); // there is no /etc/hosts in the guest
+    const a = qtype === 1 && qclass === 1 && name ? (isLocal ? [127, 0, 0, 1] : this.addrFor(name)) : null;
     const out = new Uint8Array(12 + question.length + (a ? 16 : 0));
     const ov = new DataView(out.buffer);
     ov.setUint16(0, dv.getUint16(0)); // id
@@ -87,6 +105,8 @@ export class GuestNet {
     this.transport = transport;
     this.dns = new FakeDns();
     this.socks = new Map(); // id -> { tcp: stream|null, udp: Map(dest -> stream), closed }
+    this.listeners = new Map(); // port -> listening socket's id
+    this.nextHostId = 1;
   }
 
   data(id, bytes) {
@@ -97,12 +117,14 @@ export class GuestNet {
     else if (kind === K.DATA) s.tcp?.send(bytes.subarray(1));
     else if (kind === K.SHUTDOWN) s.tcp?.shutdown?.();
     else if (kind === K.UDP) this.#udp(id, s, bytes.subarray(1, 5), (bytes[5] << 8) | bytes[6], bytes.subarray(7));
+    else if (kind === K.LISTEN) this.#listen(id, s, (bytes[1] << 8) | bytes[2]);
   }
 
   close(id) {
     const s = this.socks.get(id);
     if (!s) return;
     this.socks.delete(id);
+    if (s.listenPort !== undefined && this.listeners.get(s.listenPort) === id) this.listeners.delete(s.listenPort);
     s.closed = true;
     s.tcp?.close();
     for (const u of s.udp.values()) u.close();
@@ -116,7 +138,70 @@ export class GuestNet {
     if (!s.closed) this.send(id, bytes);
   }
 
+  /// Ends the guest's reading side of a socket (it reads EOF), if the socket is still open.
+  #eof(id) {
+    const s = this.socks.get(id);
+    if (s && !s.closed) this.closeChannel(id);
+  }
+
+  #listen(id, s, port) {
+    if (this.listeners.has(port)) return this.#toGuest(id, s, le32(EADDRINUSE));
+    this.listeners.set(port, id);
+    s.listenPort = port;
+    this.#toGuest(id, s, le32(0));
+  }
+
+  /// Makes the socket a listener on `port` accepts, joined to `peer`: { send(bytes), eof() } for the other side.
+  /// Returns the new socket's end, { send, shutdown, close }, or null if nothing listens on the port.
+  #accept(port, peerAddr, peerPort, peer) {
+    const lid = this.listeners.get(port);
+    const ls = lid === undefined ? null : this.socks.get(lid);
+    if (!ls || ls.closed) return null;
+    const id = (SOCK_BIT | HOST_ID_BIT | this.nextHostId++) >>> 0;
+    const end = { send: (b) => peer.send(b), shutdown: () => peer.eof(), close: () => peer.eof() };
+    this.socks.set(id, { tcp: end, udp: new Map(), closed: false });
+    this.#toGuest(lid, ls, acceptRecord(id, peerAddr, peerPort));
+    return { send: (b) => this.#toGuest(id, this.socks.get(id) ?? { closed: true }, b), shutdown: () => this.#eof(id),
+      close: () => this.#eof(id) };
+  }
+
+  /// Opens a connection from the page to a port the guest listens on. Returns { readable, write(data), close() }, or
+  /// throws if nothing listens there.
+  connectToGuest(port) {
+    let controller, ended = false;
+    const readable = new ReadableStream({ start: (c) => (controller = c) });
+    const end = () => {
+      if (!ended) controller.close();
+      ended = true;
+    };
+    const guest = this.#accept(port, PAGE_ADDR, 40000 + (this.nextHostId % 20000), {
+      send: (b) => ended || controller.enqueue(b.slice()),
+      eof: end,
+    });
+    if (!guest) throw Object.assign(new Error(`connection refused: nothing listens on guest port ${port}`), { errno: ECONNREFUSED });
+    return {
+      readable,
+      write: (data) => guest.send(typeof data === 'string' ? new TextEncoder().encode(data) : data),
+      /// Ends the guest's reading side (it reads EOF); the guest may still answer.
+      shutdown: () => guest.shutdown(),
+      close: () => {
+        guest.close();
+        end();
+      },
+    };
+  }
+
   #connect(id, s, ip, port) {
+    const local = ip.startsWith('127.') || ip === '0.0.0.0' || ip === GUEST_ADDR.join('.');
+    if (local && this.listeners.has(port)) {
+      s.tcp = this.#accept(port, ip === '0.0.0.0' ? [127, 0, 0, 1] : ip.split('.').map(Number), ephemeralPort(id), {
+        send: (b) => this.#toGuest(id, s, b),
+        eof: () => this.#eof(id),
+      });
+      this.#toGuest(id, s, le32(0));
+      return;
+    }
+    if (local && !ip.startsWith('127.')) return this.#toGuest(id, s, le32(ECONNREFUSED));
     if (!this.transport) {
       this.#toGuest(id, s, le32(ENETUNREACH));
       return;

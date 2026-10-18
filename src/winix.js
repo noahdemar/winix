@@ -590,6 +590,41 @@ export class Winix {
         (e) => { throw new Error(`readFile ${path}: ${e.message}`); }));
   }
 
+  /// Opens a TCP connection from the page to `port`, where a guest program listens (port forwarding). Returns
+  /// { readable (a ReadableStream of Uint8Array), write(data), shutdown(), close() }; throws if nothing listens there.
+  /// Not queued: it does not wait for exec calls.
+  connect(port) {
+    if (this.#disposed) throw new Error('Winix disposed');
+    const m = this.#machine;
+    if (!m || m.dead) throw new Error('machine is dead: ' + (m?.dead?.message ?? 'not started'));
+    return m.guestNet.connectToGuest(port);
+  }
+
+  /// Sends an HTTP/1.1 request to a server listening on `port` in the guest and resolves to a Response. Options: method,
+  /// headers (object), body (string or bytes), timeoutMs.
+  async guestFetch(port, path = '/', { method = 'GET', headers = {}, body, timeoutMs = 30000 } = {}) {
+    const c = this.connect(port);
+    const bytes = body === undefined ? null : typeof body === 'string' ? encoder.encode(body) : body;
+    let head = `${method} ${path} HTTP/1.1\r\nHost: localhost:${port}\r\nConnection: close\r\n`;
+    for (const [k, v] of Object.entries(headers)) head += `${k}: ${v}\r\n`;
+    if (bytes) head += `Content-Length: ${bytes.length}\r\n`;
+    c.write(head + '\r\n');
+    if (bytes) c.write(bytes);
+    const timer = setTimeout(() => c.close(), timeoutMs);
+    const chunks = [];
+    try {
+      for (const reader = c.readable.getReader(); ;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+    } finally {
+      clearTimeout(timer);
+      c.close();
+    }
+    return parseHttpResponse(concat(chunks), method);
+  }
+
   /// Replaces the machine with a freshly booted one (the filesystem is lost).
   reset() {
     if (this.#disposed) return Promise.reject(new Error('Winix disposed'));
@@ -602,6 +637,40 @@ export class Winix {
     this.#disposed = true;
     this.#machine?.destroy();
   }
+}
+
+/// Parses a whole HTTP/1.x response (read until the server closed the connection) into a Response.
+function parseHttpResponse(raw, method) {
+  let i = 0;
+  while (i + 3 < raw.length && !(raw[i] === 13 && raw[i + 1] === 10 && raw[i + 2] === 13 && raw[i + 3] === 10)) i++;
+  if (i + 3 >= raw.length) throw new Error('guestFetch: incomplete HTTP response from the guest');
+  const [statusLine, ...lines] = decoder.decode(raw.subarray(0, i)).split('\r\n');
+  const m = /^HTTP\/1\.[01] (\d{3})(?: (.*))?$/.exec(statusLine);
+  if (!m) throw new Error('guestFetch: bad status line: ' + statusLine.slice(0, 80));
+  const headers = new Headers();
+  for (const line of lines) {
+    const k = line.indexOf(':');
+    if (k > 0) headers.append(line.slice(0, k).trim(), line.slice(k + 1).trim());
+  }
+  let body = raw.subarray(i + 4);
+  if (/\bchunked\b/i.test(headers.get('transfer-encoding') ?? '')) {
+    const parts = [];
+    for (let o = 0; ;) {
+      const nl = body.indexOf(10, o);
+      if (nl < 0) break;
+      const size = parseInt(decoder.decode(body.subarray(o, nl)), 16);
+      if (!(size > 0)) break;
+      parts.push(body.subarray(nl + 1, nl + 1 + size));
+      o = nl + 1 + size + 2;
+    }
+    body = concat(parts);
+    headers.delete('transfer-encoding');
+  } else if (headers.has('content-length')) {
+    body = body.subarray(0, Number(headers.get('content-length')));
+  }
+  const status = Number(m[1]);
+  const empty = method === 'HEAD' || status === 204 || status === 304 || status < 200;
+  return new Response(empty ? null : body, { status: status < 200 ? 200 : status, statusText: m[2] ?? '', headers });
 }
 
 const concat = (cs) => {

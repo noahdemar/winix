@@ -60,7 +60,7 @@ try {
       }
     };
     const w = await Winix.boot({ net: wisp("/__wisp") });
-    await check("tcp by name (stand-in DNS)", w, `printf 'hi\\nbye\\n' | nc localhost ${ports.tcp}`,
+    await check("tcp to localhost, no guest listener: the relay's host", w, `printf 'hi\\nbye\\n' | nc localhost ${ports.tcp}`,
       (r) => r.stdout === "echo: hi\necho: bye\n");
     await check("tcp by address", w, `printf 'bye\\n' | nc 127.0.0.1 ${ports.tcp}`, (r) => r.stdout === "echo: bye\n");
     await check("nslookup answers from 198.18.0.0/15", w, "nslookup example.org",
@@ -69,8 +69,10 @@ try {
     await check("wget 1 MiB", w, `wget -q -O /tmp/big http://127.0.0.1:${ports.web}/big && wc -c < /tmp/big`,
       (r) => r.stdout.trim() === String(1 << 20));
     await check("wget to a refused port fails", w, "wget -q -O - http://127.0.0.1:1/", (r) => r.exitCode !== 0);
-    const py = await w.exec("apt-get install -y python >/dev/null 2>&1 && echo yes", { timeoutMs: 180000 });
-    if (py.stdout.includes("yes")) {
+    const py = await w.exec("apt-get install -y python 2>&1 && echo INSTALLED", { timeoutMs: 180000 });
+    const havePython = py.stdout.includes("INSTALLED");
+    out.push({ name: "apt-get install python", ok: havePython, ms: py.durationMs, detail: havePython ? "" : py.stdout.slice(-400) });
+    if (havePython) {
       await w.writeFile("/work/net.py", [
         "import select, socket",
         "u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.settimeout(10)",
@@ -81,13 +83,51 @@ try {
         "try: socket.create_connection(('127.0.0.1', 1), timeout=10).recv(1)",
         "except ConnectionRefusedError as e: print('refused', e.errno)",
         "a, b = socket.socketpair(); a.send(b'unix'); print(b.recv(9).decode())",
-        "try: l = socket.socket(); l.bind(('0.0.0.0', 8080)); l.listen()",
-        "except OSError as e: print('listen', e.errno)",
       ].join("\n"));
-      await check("python: udp, nonblocking connect, refused, AF_UNIX, no listen", w, "python3 /work/net.py",
-        (r) => r.stdout === `udp: ping ${ports.udp}\nconnect_ex 0\nso_error 111\nrefused 111\nunix\nlisten 95\n`);
-    } else {
-      out.push({ name: "python cases (skipped: apt-get install python failed)", ok: true, ms: 0, detail: "" });
+      await check("python: udp, nonblocking connect, refused, AF_UNIX", w, "python3 /work/net.py",
+        (r) => r.stdout === `udp: ping ${ports.udp}\nconnect_ex 0\nso_error 111\nrefused 111\nunix\n`);
+      await w.writeFile("/work/loop.py", [
+        "import select, socket",
+        "l = socket.socket(); l.bind(('127.0.0.1', 0)); l.listen(); l.setblocking(False)",
+        "port = l.getsockname()[1]; print('listening', l.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN))",
+        "try: l.accept()",
+        "except BlockingIOError: print('accept EAGAIN')",
+        "c = socket.create_connection(('localhost', port))",
+        "r, _, _ = select.select([l], [], [], 10); a, addr = l.accept(); a.setblocking(True); print('accepted', addr[0])",
+        "c.sendall(b'ping'); print(a.recv(9).decode()); a.sendall(b'pong'); print(c.recv(9).decode())",
+        "c.shutdown(socket.SHUT_WR); print('eof', a.recv(9)); a.sendall(b'late'); print(c.recv(9).decode())",
+        "a.close(); print('closed', c.recv(9))",
+        "try: socket.create_connection(('10.0.2.15', 9)).recv(1)",
+        "except ConnectionRefusedError as e: print('refused', e.errno)",
+        "try: s = socket.socket(); s.bind(('0.0.0.0', port)); s.listen()",
+        "except OSError as e: print('in use', e.errno)",
+      ].join("\n"));
+      await check("python: listen, accept, loopback, half-close, EADDRINUSE", w, "python3 /work/loop.py",
+        (r) => r.stdout === "listening 1\naccept EAGAIN\naccepted 127.0.0.1\nping\npong\neof b''\nlate\n" +
+          "closed b''\nrefused 111\nin use 98\n");
+      await w.writeFile("/work/www/hi.txt", "hi from the guest\n");
+      await w.writeFile("/work/srv.py", "import os\nfrom http.server import HTTPServer, SimpleHTTPRequestHandler\n" +
+        "os.chdir('/work/www')\nHTTPServer(('0.0.0.0', 8080), SimpleHTTPRequestHandler).serve_forever()\n");
+      await check("guest http server, fetched inside the guest", w,
+        "python3 /work/srv.py >/tmp/srv.log 2>&1 & sleep 2; wget -q -O - http://127.0.0.1:8080/hi.txt",
+        (r) => r.stdout === "hi from the guest\n");
+      const t0 = performance.now();
+      try {
+        const res = await w.guestFetch(8080, "/hi.txt");
+        const text = await res.text();
+        const missing = await w.guestFetch(8080, "/nope");
+        const ok = res.status === 200 && text === "hi from the guest\n" && missing.status === 404;
+        out.push({ name: "page -> guest: guestFetch", ok, ms: performance.now() - t0,
+          detail: ok ? "" : `${res.status} ${JSON.stringify(text)} ${missing.status}` });
+      } catch (e) {
+        out.push({ name: "page -> guest: guestFetch", ok: false, ms: performance.now() - t0, detail: String(e) });
+      }
+    }
+    {
+      let errno = 0;
+      try { w.connect(9999); } catch (e) { errno = e.errno; }
+      out.push({ name: "page -> guest: connect to a closed port throws ECONNREFUSED", ok: errno === 111, ms: 0,
+        detail: String(errno) });
     }
     w.dispose();
     const off = await Winix.boot({});

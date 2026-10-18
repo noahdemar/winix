@@ -59,10 +59,10 @@ index 69d40d827..404317413 100755
  
 diff --git a/arch/wasm/kernel/winixnet.c b/arch/wasm/kernel/winixnet.c
 new file mode 100755
-index 000000000..a2c3a3343
+index 000000000..a64c452c3
 --- /dev/null
 +++ b/arch/wasm/kernel/winixnet.c
-@@ -0,0 +1,616 @@
+@@ -0,0 +1,724 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * AF_INET sockets carried by the Wasm host page (there is no IP stack or NIC).
@@ -73,10 +73,14 @@ index 000000000..a2c3a3343
 + *   2 TCP data:    bytes
 + *   3 UDP send:    be32 addr, be16 port, bytes
 + *   4 TCP shutdown of the sending side
++ *   5 TCP listen:  be16 port
 + * Host -> kernel, a byte stream read with wasm_driver_winix_get():
 + *   TCP: le32 connect result (0 or a positive errno), then the peer's bytes; the host closing the channel is EOF.
 + *   UDP: datagrams, each be32 addr, be16 port, le16 length, bytes.
-+ * There is no listening or accepting: the host can only make outgoing connections.
++ *   Listening TCP: le32 listen result, then one record per incoming connection: le32 channel id (made by the host,
++ *   already connected), be32 peer addr, be16 peer port.
++ * Listening sockets take connections the host pairs with them: from other guest sockets connecting to that port on a
++ * local address, and from the page itself (port forwarding).
 + *
 + * WISP does not acknowledge connections, so the host sends the connect result when it learns it: with the first bytes
 + * from the peer, or when the connection closes. connect() therefore succeeds at once (data may be sent right away),
@@ -98,6 +102,7 @@ index 000000000..a2c3a3343
 +#include <linux/sockios.h>
 +#include <linux/unaligned.h>
 +#include <net/sock.h>
++#include <net/tcp_states.h>
 +
 +extern ssize_t wasm_driver_winix_put(u32 id, const u8 *buf, size_t count);
 +extern ssize_t wasm_driver_winix_get(u32 id, u8 *buf, size_t count);
@@ -109,7 +114,8 @@ index 000000000..a2c3a3343
 +#define WSOCK_TXCHUNK (32 * 1024)
 +#define WSOCK_UDP_HDR 8
 +
-+enum { WS_NEW, WS_CONNECTING, WS_CONNECTED, WS_FAILED };
++enum { WS_NEW, WS_CONNECTING, WS_CONNECTED, WS_FAILED, WS_LISTENING };
++#define WSOCK_ACCEPT_REC 10
 +
 +struct wsock {
 +	struct sock sk; /* must be first */
@@ -194,6 +200,11 @@ index 000000000..a2c3a3343
 +	return wasm_driver_winix_put(ws->id, buf, len) == len ? 0 : -EIO;
 +}
 +
++static __be16 ws_local_port(struct wsock *ws)
++{
++	return ws->local_port ? ws->local_port : htons(32768 + (ws->id & 0x3fff));
++}
++
 +static void ws_timer(struct timer_list *t)
 +{
 +	struct wsock *ws = timer_container_of(ws, t, timer);
@@ -274,6 +285,10 @@ index 000000000..a2c3a3343
 +		ws->opened = true; /* replies may arrive; the host makes the channel on the first send */
 +		goto out;
 +	}
++	if (ws->state == WS_LISTENING) {
++		err = -EINVAL;
++		goto out;
++	}
 +	if (ws->state != WS_NEW) {
 +		err = -EISCONN;
 +		goto out;
@@ -309,7 +324,7 @@ index 000000000..a2c3a3343
 +	} else {
 +		/* There is no interface; report a private address and a stable port per socket. */
 +		sin->sin_addr.s_addr = ws->local_addr ? ws->local_addr : htonl(0x0a00020f); /* 10.0.2.15 */
-+		sin->sin_port = ws->local_port ? ws->local_port : htons(32768 + (ws->id & 0x3fff));
++		sin->sin_port = ws_local_port(ws);
 +	}
 +	return sizeof(*sin);
 +}
@@ -350,6 +365,10 @@ index 000000000..a2c3a3343
 +			break;
 +		case WS_NEW:
 +			mask |= EPOLLOUT | EPOLLHUP;
++			break;
++		case WS_LISTENING:
++			if (ws->rxlen >= WSOCK_ACCEPT_REC)
++				mask |= EPOLLIN | EPOLLRDNORM;
 +			break;
 +		}
 +	}
@@ -409,41 +428,24 @@ index 000000000..a2c3a3343
 +	return err;
 +}
 +
++/*
++ * Only options above SOL_SOCKET come here (the core handles SOL_SOCKET from the struct sock: SO_ERROR reads sk_err,
++ * SO_ACCEPTCONN sk_state, SO_PROTOCOL sk_protocol). TCP_NODELAY, IP_TOS and the like mean nothing here: setting them
++ * succeeds, and reading them gives 0.
++ */
 +static int ws_setsockopt(struct socket *sock, int level, int optname, sockptr_t optval, unsigned int optlen)
 +{
-+	/* Buffer sizes, keepalive, Nagle and the like mean nothing here; accept them so programs carry on. */
 +	return 0;
 +}
 +
 +static int ws_getsockopt(struct socket *sock, int level, int optname, char __user *optval, int __user *optlen)
 +{
-+	struct wsock *ws = wsk(sock->sk);
 +	int len, val = 0;
 +
 +	if (get_user(len, optlen))
 +		return -EFAULT;
 +	if (len < 0)
 +		return -EINVAL;
-+	if (level == SOL_SOCKET) {
-+		switch (optname) {
-+		case SO_ERROR:
-+			val = xchg(&ws->sk.sk_err, 0);
-+			break;
-+		case SO_TYPE:
-+			val = sock->type;
-+			break;
-+		case SO_DOMAIN:
-+			val = AF_INET;
-+			break;
-+		case SO_PROTOCOL:
-+			val = sock->type == SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP;
-+			break;
-+		case SO_RCVBUF:
-+		case SO_SNDBUF:
-+			val = WSOCK_RXCAP;
-+			break;
-+		}
-+	}
 +	len = min_t(int, len, sizeof(int));
 +	if (put_user(len, optlen) || copy_to_user(optval, &val, len))
 +		return -EFAULT;
@@ -497,7 +499,7 @@ index 000000000..a2c3a3343
 +		err = ws->sk.sk_err ? -ws->sk.sk_err : -EPIPE;
 +	else if (ws->shut_wr)
 +		err = -EPIPE;
-+	else if (ws->state == WS_NEW)
++	else if (ws->state == WS_NEW || ws->state == WS_LISTENING)
 +		err = -ENOTCONN;
 +	if (err) {
 +		mutex_unlock(&ws->lock);
@@ -550,7 +552,7 @@ index 000000000..a2c3a3343
 +					err = -ECONNRESET;
 +				goto out;
 +			}
-+			if (ws->state == WS_NEW) {
++			if (ws->state == WS_NEW || ws->state == WS_LISTENING) {
 +				err = -ENOTCONN;
 +				goto out;
 +			}
@@ -606,7 +608,119 @@ index 000000000..a2c3a3343
 +
 +static int ws_listen(struct socket *sock, int backlog)
 +{
-+	return -EOPNOTSUPP;
++	struct wsock *ws = wsk(sock->sk);
++	__be16 port;
++	u8 msg[3];
++	int err;
++
++	if (sock->type != SOCK_STREAM)
++		return -EOPNOTSUPP;
++	mutex_lock(&ws->lock);
++	if (ws->state == WS_LISTENING) {
++		err = 0; /* only the backlog changes, and there is none to change */
++		goto out;
++	}
++	if (ws->state != WS_NEW) {
++		err = -EINVAL;
++		goto out;
++	}
++	port = ws_local_port(ws);
++	msg[0] = 5;
++	memcpy(msg + 1, &port, 2);
++	err = ws_put(ws, msg, sizeof(msg));
++	if (err)
++		goto out;
++	/* The host answers at once. */
++	for (;;) {
++		ws_pump(ws);
++		if (ws->rxlen >= 4 || ws->eof)
++			break;
++		if (ws_wait(ws)) {
++			err = -ERESTARTSYS; /* the host still registered the port; release() unregisters it */
++			goto out;
++		}
++	}
++	if (ws->rxlen < 4) {
++		err = -EIO;
++		goto out;
++	}
++	err = -(int)get_unaligned_le32(ws->rx);
++	ws_drop(ws, 4);
++	if (!err) {
++		ws->local_port = port;
++		ws->state = WS_LISTENING;
++		ws->sk.sk_state = TCP_LISTEN;
++		sock->state = SS_UNCONNECTED;
++	}
++out:
++	mutex_unlock(&ws->lock);
++	return err;
++}
++
++static void ws_init(struct wsock *ws, u32 id)
++{
++	mutex_init(&ws->lock);
++	timer_setup(&ws->timer, ws_timer, 0);
++	ws->id = id;
++	ws->state = WS_NEW;
++	ws->opened = ws->eof = ws->shut_rd = ws->shut_wr = false;
++	ws->rxlen = 0;
++	ws->peer_addr = ws->local_addr = 0;
++	ws->peer_port = ws->local_port = 0;
++}
++
++static int ws_accept(struct socket *sock, struct socket *newsock, struct proto_accept_arg *arg)
++{
++	struct wsock *ws = wsk(sock->sk), *nws;
++	struct sock *nsk;
++	u8 rec[WSOCK_ACCEPT_REC];
++	int err = 0;
++
++	mutex_lock(&ws->lock);
++	if (ws->state != WS_LISTENING) {
++		err = -EINVAL;
++		goto out;
++	}
++	for (;;) {
++		ws_pump(ws);
++		if (ws->rxlen >= WSOCK_ACCEPT_REC)
++			break;
++		if (arg->flags & O_NONBLOCK) {
++			err = -EAGAIN;
++			goto out;
++		}
++		if (ws_wait(ws)) {
++			err = -ERESTARTSYS;
++			goto out;
++		}
++	}
++	nsk = sk_alloc(sock_net(sock->sk), PF_INET, GFP_KERNEL, &winix_proto, arg->kern);
++	if (!nsk) {
++		err = -ENOMEM;
++		goto out;
++	}
++	nws = wsk(nsk);
++	nws->rx = kmalloc(WSOCK_RXCAP, GFP_KERNEL);
++	if (!nws->rx) {
++		sk_free(nsk);
++		err = -ENOMEM;
++		goto out;
++	}
++	memcpy(rec, ws->rx, sizeof(rec));
++	ws_drop(ws, sizeof(rec));
++	sock_init_data(newsock, nsk);
++	ws_init(nws, get_unaligned_le32(rec));
++	nws->opened = true;
++	nws->state = WS_CONNECTED;
++	nsk->sk_protocol = IPPROTO_TCP;
++	memcpy(&nws->peer_addr, rec + 4, 4);
++	memcpy(&nws->peer_port, rec + 8, 2);
++	nws->local_addr = ws->local_addr;
++	nws->local_port = ws->local_port;
++	newsock->state = SS_CONNECTED;
++out:
++	mutex_unlock(&ws->lock);
++	return err;
 +}
 +
 +static const struct proto_ops winix_inet_ops = {
@@ -616,7 +730,7 @@ index 000000000..a2c3a3343
 +	.bind = ws_bind,
 +	.connect = ws_connect,
 +	.socketpair = sock_no_socketpair,
-+	.accept = sock_no_accept,
++	.accept = ws_accept,
 +	.getname = ws_getname,
 +	.poll = ws_poll,
 +	.ioctl = ws_ioctl,
@@ -657,14 +771,8 @@ index 000000000..a2c3a3343
 +	}
 +	sock->ops = &winix_inet_ops;
 +	sock_init_data(sock, sk);
-+	mutex_init(&ws->lock);
-+	timer_setup(&ws->timer, ws_timer, 0);
-+	ws->id = winix_new_id() | WINIX_SOCK_BIT;
-+	ws->state = WS_NEW;
-+	ws->opened = ws->eof = ws->shut_rd = ws->shut_wr = false;
-+	ws->rxlen = 0;
-+	ws->peer_addr = ws->local_addr = 0;
-+	ws->peer_port = ws->local_port = 0;
++	ws_init(ws, winix_new_id() | WINIX_SOCK_BIT);
++	sk->sk_protocol = sock->type == SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP;
 +	return 0;
 +}
 +
