@@ -1,10 +1,11 @@
 # CPython 3.12 (python3) cross-built for winix's wasm32 musl guest. Sourced by scripts/build-packages.sh.
 # The cross build needs a native CPython 3.12 on the build host, which must match the source version. If
 # WINIX_HOST_PYTHON is unset, the recipe builds one from the same source with the host compiler.
+source "$REPO/packages/openssl.inc"
 NAME=python
 VERSION=3.12.8
-DEPS=-
-DESC="Python 3.12 interpreter and standard library (sqlite3; no threads, no dynamic extension modules)"
+DEPS=ca-certificates
+DESC="Python 3.12 interpreter and standard library (sqlite3, ssl; no threads, no dynamic extension modules)"
 URL=https://www.python.org/ftp/python/$VERSION/Python-$VERSION.tgz
 SHA256=5978435c479a376648cb02854df3b892ace9ed7d32b1fead652712bee9d03a45
 ZLIB_URL=https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
@@ -41,6 +42,11 @@ build() {
 		-DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_MATH_FUNCTIONS -c "$SQLITE/sqlite3.c" -o "$SQLITE/sqlite3.o" || return 1
 	"$WORK/bin/ar" rcs "$SQLITE/libsqlite3.a" "$SQLITE/sqlite3.o" || return 1
 
+	# ssl and hashlib: OpenSSL as static libraries, installed into a staging prefix for configure to find.
+	build_openssl "$PWD/opensslsrc" || return 1
+	make -C opensslsrc install_dev DESTDIR="$PWD/ossl" >/dev/null || return 1
+	OSSL="$PWD/ossl/usr"
+
 	# The guest toolchain cannot run test programs, so facts configure would probe are given here. Any function
 	# musl lacks that configure still finds (the guest link is -shared, which accepts undefined symbols) must be listed.
 	export ac_cv_file__dev_ptmx=no ac_cv_file__dev_ptc=no ac_cv_func_dlopen=no ac_cv_lib_dl_dlopen=no \
@@ -52,7 +58,8 @@ build() {
 	CC="$WASM_CC" CPPFLAGS="-I$ZLIB -I$SQLITE" LDFLAGS="-L$ZLIB -L$SQLITE" ./configure \
 		--host=wasm32-linux-musl --build=x86_64-pc-linux-gnu --with-build-python="$HOSTPY" \
 		--prefix=/usr --disable-shared --without-pymalloc --without-ensurepip --disable-ipv6 \
-		--without-doc-strings --without-threads >configure.log 2>&1 || { tail -40 configure.log; return 1; }
+		--without-doc-strings --without-threads --with-openssl="$OSSL" >configure.log 2>&1 		|| { tail -40 configure.log; return 1; }
+	grep -q '^MODULE__SSL_STATE=yes' Makefile || { grep -i -A3 openssl configure.log | tail -20; return 1; }
 
 	# Modules are listed explicitly: sqlite3 is built statically from the amalgamation; the others need libraries
 	# winix does not package yet (_lzma: xz, readline, nis: rpcsvc headers, _ctypes: libffi, _uuid: libuuid).
@@ -65,7 +72,7 @@ build() {
 	# references become 373 GOT.* imports, which winix's runtime does not supply, so the module fails to instantiate
 	# (reported as "Illegal instruction"). Lua has none. The link stays the shared-object form the loader expects.
 	rm -f python
-	make -j"$(nproc)" LDFLAGS="-L$ZLIB -L$SQLITE -Wl,-Bsymbolic" python || return 1
+	make -j"$(nproc)" LDFLAGS="-L$ZLIB -L$SQLITE -L$OSSL/lib -Wl,-Bsymbolic" python || return 1
 	[ -x python ] || return 1
 
 	mkdir -p "$DEST/usr/bin" "$DEST/usr/lib/python3.12/lib-dynload" # no extension modules: lib-dynload stays empty

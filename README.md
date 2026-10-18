@@ -58,6 +58,9 @@ await w.exec('wget -q -O - http://example.com/ | head -c 100');
   ```
 - No IPv6. Over WISP there is no TCP half-close (`shutdown(SHUT_WR)` sends nothing); between guest sockets and to the
   page it works. BusyBox `nc` and `wget` (HTTP only) are enabled.
+- TLS runs in the guest: `apt-get install -y python` gives Python's `ssl` (OpenSSL 3.5, statically linked), and
+  `openssl` gives `openssl s_client`; both verify against Mozilla's roots in `/etc/ssl/cert.pem`. The page sets the
+  guest's clock at boot (`date -s`), since it starts at 1970 and certificates would look not yet valid.
 - Without `net`, connections fail with ENETUNREACH. `/__wisp` makes connections for anyone who can reach it, so in
   production point `wisp()` at your own server and restrict it.
 
@@ -70,7 +73,8 @@ Focused check (no internet needed): `node tests/net.mjs` with the server above r
 1. **Native (fast):** wasm builds from the recipes in `packages/`. `apt-get install -y sqlite` downloads
    `pkgs/sqlite_<ver>_<hash>.tar.gz` from next to the page (the guest's `winix://` URLs), checks its SHA-256 against
    `pkgs/index.txt`, and unpacks it at `/`. Archive names include a content hash, so browsers cache them forever.
-   Available: `sqlite` (sqlite3), `lua`, `blink`.
+   Available: `sqlite` (sqlite3), `lua`, `jq`, `zlib`, `python` (CPython 3.12 with `ssl` and `sqlite3`), `openssl`,
+   `ca-certificates`, `blink`. Dependencies are installed first (`python` and `openssl` bring `ca-certificates`).
 2. **Fallback (broad, slower):** anything else is resolved against Alpine Linux's x86-64 repositories (`main` and
    `community`, with dependencies), unpacked into `/opt/x86`, and given a wrapper in `/usr/bin` that runs it under
    [Blink](https://github.com/jart/blink), an x86-64 Linux user-mode emulator built as a winix package. So

@@ -170,8 +170,13 @@ await w.exec('printf "HEAD / HTTP/1.0
       on goes to the WISP server, which reaches its own machine's localhost.</li>
     <li>No IPv6. Over WISP, <code>shutdown(SHUT_WR)</code> sends nothing to the peer; between guest sockets, and to the
       page, it works.</li>
-    <li>BusyBox <code>nc</code> and <code>wget</code> (HTTP only) are included. For HTTPS, use <code>curl</code>, which
-      goes through <code>fetch</code>.</li>
+    <li>BusyBox <code>nc</code> and <code>wget</code> (HTTP only) are included; <code>curl</code> does HTTPS through
+      <code>fetch</code>.</li>
+    <li>TLS runs in the guest's own programs: <code>apt-get install -y python</code> gives Python's <code>ssl</code>
+      (OpenSSL 3.5), and <code>apt-get install -y openssl</code> gives <code>openssl s_client</code>. Both verify
+      against Mozilla's root certificates in <code>/etc/ssl/cert.pem</code> (the <code>ca-certificates</code> package,
+      installed with them). <code>boot()</code> sets the guest's clock, which starts at 1970, so certificate dates
+      check correctly.</li>
     <li>A WISP server connects anywhere for anyone who can reach it. In production, run your own, restrict the hosts and
       ports it allows, and pass its URL: <code>wisp('wss://relay.example/')</code>.</li>
   </ul>
@@ -219,6 +224,5 @@ const { value } = await c.readable.getReader().read();</code></pre>
     only archives you trust. Nothing in the archive runs as code: it is validated before any machine starts.</p>
 
   <h2 id="not-yet">Not yet</h2>
-  <p>These are planned but not part of this release: TLS in the guest's own programs (Python <code>ssl</code>,
-    <code>wget https</code>), and <code>w.ping()</code>.</p>
+  <p>These are planned but not part of this release: <code>wget https</code>, IPv6, and <code>w.ping()</code>.</p>
 </main>

@@ -30,6 +30,7 @@ field() { awk -v p="$1" -v n="$2" '$1 == p { print $n; exit }' "$INDEX"; }
 installed_version() { [ -f "$DB/$1" ] && head -n 1 "$DB/$1"; }
 
 install_one() {
+	local pkg ver deps d sum file tmp # it recurses for dependencies
 	pkg=$1
 	ver=$(field "$pkg" 2)
 	[ -n "$ver" ] || { echo "E: Unable to locate package $pkg" >&2; return 100; }

@@ -168,6 +168,9 @@ class Machine {
     } finally {
       clearTimeout(timer);
     }
+    // The guest's wall clock starts at 1970; TLS certificate checks (and file times) need the real time.
+    await this.request(OP.EXEC, [10000, 4096, '/', `date -u -s @${Math.round(Date.now() / 1000)} >/dev/null`],
+      (op, r) => (op === RP.EXIT ? r.i32() : undefined), 10000 + BACKSTOP_MS);
   }
 
   onFrame(id, tag, op, r) {

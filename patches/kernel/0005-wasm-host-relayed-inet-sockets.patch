@@ -59,7 +59,7 @@ index 69d40d827..404317413 100755
  
 diff --git a/arch/wasm/kernel/winixnet.c b/arch/wasm/kernel/winixnet.c
 new file mode 100755
-index 000000000..a64c452c3
+index 000000000..f7f41247b
 --- /dev/null
 +++ b/arch/wasm/kernel/winixnet.c
 @@ -0,0 +1,724 @@

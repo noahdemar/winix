@@ -1,11 +1,13 @@
 // Focused check of guest sockets (patches/kernel/0005, src/net.js, scripts/wisp-server.mjs) without the internet: local
 // TCP/UDP/HTTP servers are reached from the guest through serve.mjs's /__wisp relay. Build first: scripts/build.sh
 // kernel and busybox (WSL). Serve dist/ with `node scripts/serve.mjs dist 8000`, then: node tests/net.mjs [origin]
+// The TLS case uses tests/fixtures/net-tls (a test-only CA and localhost certificate).
 // Writes build/net-results.json. Env: PW_CHANNEL (e.g. msedge), PLAYWRIGHT_CORE (path to playwright-core).
 import { createRequire } from "node:module";
 import dgram from "node:dgram";
 import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
 import net from "node:net";
 fs.mkdirSync("build", { recursive: true });
 
@@ -31,14 +33,21 @@ const web = http.createServer((req, res) => {
   if (req.url === "/big") return res.end(big);
   res.end(`hello from ${req.url}\n`);
 });
+const tlsDir = new URL("./fixtures/net-tls/", import.meta.url);
+const secure = https.createServer({
+  key: fs.readFileSync(new URL("server.key", tlsDir)), cert: fs.readFileSync(new URL("server.pem", tlsDir)),
+}, (req, res) => res.end(`secure hello from ${req.url}\n`));
+const testCa = fs.readFileSync(new URL("ca.pem", tlsDir), "utf8");
 const udp = dgram.createSocket("udp4");
 udp.on("message", (m, r) => udp.send(Buffer.concat([Buffer.from("udp: "), m]), r.port, r.address));
 await Promise.all([
   new Promise((r) => tcp.listen(0, "127.0.0.1", r)),
   new Promise((r) => web.listen(0, "127.0.0.1", r)),
   new Promise((r) => udp.bind(0, "127.0.0.1", r)),
+  new Promise((r) => secure.listen(0, "127.0.0.1", r)),
 ]);
-const ports = { tcp: tcp.address().port, web: web.address().port, udp: udp.address().port };
+const ports = { tcp: tcp.address().port, web: web.address().port, udp: udp.address().port,
+  tls: secure.address().port, testCa };
 
 const browser = await chromium.launch({ channel: process.env.PW_CHANNEL });
 let results = [], pageError = null;
@@ -105,6 +114,18 @@ try {
       await check("python: listen, accept, loopback, half-close, EADDRINUSE", w, "python3 /work/loop.py",
         (r) => r.stdout === "listening 1\naccept EAGAIN\naccepted 127.0.0.1\nping\npong\neof b''\nlate\n" +
           "closed b''\nrefused 111\nin use 98\n");
+      await w.writeFile("/work/ca.pem", ports.testCa);
+      await w.writeFile("/work/tls.py", [
+        "import ssl, urllib.request",
+        `url = 'https://localhost:${ports.tls}/x'`,
+        "ctx = ssl.create_default_context(cafile='/work/ca.pem')",
+        "print(urllib.request.urlopen(url, context=ctx).read().decode(), end='')",
+        "try: urllib.request.urlopen(url)",
+        "except Exception as e: print('default roots reject the test CA:', 'CERTIFICATE_VERIFY_FAILED' in str(e))",
+        "print('system roots loaded:', ssl.create_default_context().cert_store_stats()['x509_ca'] > 100)",
+      ].join("\n"));
+      await check("python ssl: https with verification", w, "python3 /work/tls.py",
+        (r) => r.stdout === "secure hello from /x\ndefault roots reject the test CA: True\nsystem roots loaded: True\n");
       await w.writeFile("/work/www/hi.txt", "hi from the guest\n");
       await w.writeFile("/work/srv.py", "import os\nfrom http.server import HTTPServer, SimpleHTTPRequestHandler\n" +
         "os.chdir('/work/www')\nHTTPServer(('0.0.0.0', 8080), SimpleHTTPRequestHandler).serve_forever()\n");
@@ -143,6 +164,7 @@ try {
   tcp.close();
   web.close();
   udp.close();
+  secure.close();
 }
 
 const checks = [{ name: "page completed", ok: !pageError, detail: pageError ?? "" }, ...results];
