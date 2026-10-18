@@ -42,7 +42,7 @@
 <div id="wrap"><div id="terminal"></div></div>
 <script src="xterm.js"></script>
 <script type="module">
-  import { Winix, proxyFetch } from './winix.js';
+  import { Winix, proxyFetch, wisp } from './winix.js';
 
   const css = getComputedStyle(document.documentElement);
   const term = new Terminal({
@@ -105,7 +105,7 @@
     if (!crossOriginIsolated) throw new Error('page is not cross-origin isolated (COOP/COEP headers missing)');
     const first = newInst(null);
     const t0 = performance.now();
-    first.w = await Winix.boot({ onConsole: consoleFor(first), onLog: log, fetch: proxyFetch() });
+    first.w = await Winix.boot({ onConsole: consoleFor(first), onLog: log, fetch: proxyFetch(), net: wisp('/__wisp') });
     cur = first;
     status.textContent = `ready · ${Math.round(performance.now() - t0)} ms`;
     sendSize(first);
@@ -161,6 +161,7 @@
         onConsole: consoleFor(inst),
         onLog: log,
         fetch: proxyFetch(),
+        net: wisp('/__wisp'),
         onProgress: (p) => { status.textContent = `${p.phase} ${p.filesDone}/${p.filesTotal} files`; },
       });
     } catch (e) {

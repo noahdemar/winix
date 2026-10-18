@@ -1,7 +1,10 @@
 // winix host API: boots the linux-wasm kernel in a hidden iframe and talks to the guest's winixd over /dev/winix,
 // a binary channel (see guest/winix-proto.h for the frame format). Guest programs such as curl open their own
-// channels; their HTTP requests are made with the page's fetch (or the `fetch` passed to boot()).
+// channels; their HTTP requests are made with the page's fetch (or the `fetch` passed to boot()). Guest sockets are
+// channels too, relayed by net.js through the `net` transport passed to boot().
 
+import { GuestNet, SOCK_BIT } from './net.js';
+export { wisp } from './net.js';
 import { CHUNK, LIMITS, checkPath, cloneHostState, encodeArchive, hexOf, readArchive, sha256, validateManifest } from './session.js';
 
 const BOOT_CMDLINE =
@@ -113,8 +116,8 @@ const getAssets = (baseUrl, variant) => {
 
 /// One booted guest: iframe + channels to winixd and to guest clients (curl).
 class Machine {
-  constructor({ baseUrl, variant, onLog, onConsole, cmdline, fetch }) {
-    Object.assign(this, { baseUrl, variant, cmdline, fetch });
+  constructor({ baseUrl, variant, onLog, onConsole, cmdline, fetch, net }) {
+    Object.assign(this, { baseUrl, variant, cmdline, fetch, net });
     this.onLog = onLog || (() => {});
     this.onConsole = onConsole || (() => {});
     this.dead = null;
@@ -136,6 +139,7 @@ class Machine {
 
   destroy(reason = new Error('machine disposed')) {
     this.kill(reason);
+    this.guestNet?.dispose();
     window.removeEventListener('message', this.onMessage);
     this.iframe?.remove();
     this.iframe = null;
@@ -156,7 +160,9 @@ class Machine {
     this.os = await iframe.contentWindow.linux(
       new URL('linux-worker.js', this.baseUrl).href, this.variant, module, this.cmdline, initrd.slice(0),
       (t) => this.onLog(t), (d) => this.onConsole(d));
-    attachChannels(this.os, { fetch: this.fetch, baseUrl: this.baseUrl, onFrame: (...a) => this.onFrame(...a) });
+    this.guestNet = attachChannels(this.os, {
+      fetch: this.fetch, net: this.net, baseUrl: this.baseUrl, onFrame: (...a) => this.onFrame(...a),
+    });
     try {
       await ready;
     } finally {
@@ -207,9 +213,12 @@ class Machine {
 
 /// Routes the /dev/winix channels of a booted linux() instance. HTTP requests from guest programs (curl, apt) are
 /// made with `fetch`; winix://path URLs resolve against baseUrl, where the package repository (pkgs/) is served.
-/// Other frames go to onFrame(channelId, tag, op, reader).
-export function attachChannels(os, { fetch: fetchFn = (...a) => fetch(...a), baseUrl = document.baseURI, onFrame = () => {} } = {}) {
+/// Socket channels go to a GuestNet relaying through the `net` transport (returned; without one, connections fail with
+/// ENETUNREACH). Other frames go to onFrame(channelId, tag, op, reader).
+export function attachChannels(os, { fetch: fetchFn = (...a) => fetch(...a), net = null, baseUrl = document.baseURI,
+  onFrame = () => {} } = {}) {
   const channels = new Map(); // id -> Framer
+  const guestNet = new GuestNet({ send: os.winix.send, close: os.winix.close }, net);
   const serveFetch = async (id, tag, r) => {
     const send = (op, ...f) => os.winix.send(id, frame(tag, op, ...f));
     try {
@@ -244,12 +253,14 @@ export function attachChannels(os, { fetch: fetchFn = (...a) => fetch(...a), bas
   };
   os.winix.set_handler({
     data: (id, bytes) => {
+      if (id & SOCK_BIT) return guestNet.data(id, bytes);
       let c = channels.get(id);
       if (!c) channels.set(id, (c = new Framer((tag, op, r) => (op === OP.FETCH ? serveFetch(id, tag, r) : onFrame(id, tag, op, r)))));
       c.push(bytes);
     },
-    close: (id) => channels.delete(id),
+    close: (id) => (id & SOCK_BIT ? guestNet.close(id) : channels.delete(id)),
   });
+  return guestNet;
 }
 
 /// A fetch for Winix.boot({ fetch }) that sends cross-origin requests through a proxy endpoint (such as
@@ -416,10 +427,13 @@ async function restoreFs(m, manifest, payload, report) {
 
 export class Winix {
   /// Options: baseUrl (where vmlinux/initramfs/linux.js live), variant, onLog (host diagnostics), onConsole (guest
-  /// console text), cmdline, fetch (used for guest HTTP requests; default: the page's fetch).
+  /// console text), cmdline, fetch (used for guest HTTP requests; default: the page's fetch), net (a transport for guest
+  /// sockets such as wisp(url); default: none, so connections fail with ENETUNREACH).
   static async boot({ baseUrl = new URL('./', import.meta.url), variant = 'wasm32_nommu', onLog, onConsole,
-    cmdline = BOOT_CMDLINE, fetch: fetchFn = (...a) => fetch(...a) } = {}) {
-    const w = new Winix({ baseUrl: new URL(baseUrl, document.baseURI).href, variant, onLog, onConsole, cmdline, fetch: fetchFn });
+    cmdline = BOOT_CMDLINE, fetch: fetchFn = (...a) => fetch(...a), net = null } = {}) {
+    const w = new Winix({
+      baseUrl: new URL(baseUrl, document.baseURI).href, variant, onLog, onConsole, cmdline, fetch: fetchFn, net,
+    });
     await w.#newMachine();
     return w;
   }

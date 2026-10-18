@@ -1,10 +1,12 @@
 // Static server with COOP/COEP headers (needed for SharedArrayBuffer), on localhost only.
 // Also /__proxy?url=<http(s) url>: forwards the request server-side, so guest curl can reach sites without CORS.
+// And /__wisp: a WISP WebSocket endpoint (scripts/wisp-server.mjs) that carries guest TCP/UDP sockets.
 // Usage: node scripts/serve.mjs [dir=dist] [port=8000]
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { Readable } from "node:stream";
+import { attachWisp } from "./wisp-server.mjs";
 
 const root = path.resolve(process.argv[2] ?? "dist");
 const port = Number(process.argv[3] ?? 8000);
@@ -42,7 +44,7 @@ async function proxy(req, res, target) {
   }
 }
 
-http
+const server = http
   .createServer((req, res) => {
     const url = new URL(req.url, "http://x");
     res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
@@ -64,5 +66,6 @@ http
     if (/^\/pkgs\/.+_.+\.tar\.gz$/.test(rel)) res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
     res.writeHead(200, { "Content-Type": types[path.extname(file)] ?? "application/octet-stream" });
     fs.createReadStream(file).pipe(res);
-  })
-  .listen(port, "127.0.0.1", () => console.log(`serving ${root} on http://127.0.0.1:${port}/`));
+  });
+attachWisp(server, "/__wisp");
+server.listen(port, "127.0.0.1", () => console.log(`serving ${root} on http://127.0.0.1:${port}/`));

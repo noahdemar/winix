@@ -40,6 +40,7 @@
   <nav>
     <a href="#boot">Boot</a><a href="#exec">exec</a><a href="#files">Files</a><a href="#keys">keyInput</a>
     <a href="#sessions">Sessions</a><a href="#lifecycle">Lifecycle</a><a href="#fetch">Network</a>
+    <a href="#sockets">Sockets</a>
     <a href="#curl">curl</a><a href="#format">Session format</a><a href="#not-yet">Not yet</a>
   </nav>
 
@@ -56,7 +57,8 @@ const w = await Winix.boot({ fetch: proxyFetch() });</code></pre>
     <tr><td><code>onLog</code></td><td>none</td><td>Receives host diagnostics (boot messages and runtime events).</td></tr>
     <tr><td><code>onConsole</code></td><td>none</td><td>Receives the guest console text, as it is printed.</td></tr>
     <tr><td><code>cmdline</code></td><td>built-in</td><td>Kernel command line.</td></tr>
-    <tr><td><code>fetch</code></td><td>the page's <code>fetch</code></td><td>Function used for every HTTP request the guest makes. See <a href="#fetch">Network</a>.</td></tr>
+    <tr><td><code>fetch</code></td><td>the page's <code>fetch</code></td><td>Function used for every HTTP request the guest's <code>curl</code> makes. See <a href="#fetch">Network</a>.</td></tr>
+    <tr><td><code>net</code></td><td>none</td><td>Transport for guest sockets, such as <code>wisp(url)</code>. Without one, connections fail with <code>ENETUNREACH</code>. See <a href="#sockets">Sockets</a>.</td></tr>
   </table>
 
   <h2 id="exec">exec</h2>
@@ -123,8 +125,8 @@ w2.hostState; // the object saved above</code></pre>
   </table>
 
   <h2 id="fetch">Network</h2>
-  <p>The guest has no sockets. Every HTTP request it makes is passed to the <code>fetch</code> function you give to
-    <code>boot()</code>. That function decides what happens to the request: it can forward it, log it, or refuse it.
+  <p>Every HTTP request made by the guest's <code>curl</code> is passed to the <code>fetch</code> function you give to
+    <code>boot()</code>. Guest sockets are separate; see <a href="#sockets">Sockets</a>. That function decides what happens to the request: it can forward it, log it, or refuse it.
     Requests are made with the page's origin and browser credentials, so treat that function as a security boundary.</p>
   <pre><code>import { Winix } from './winix.js';
 
@@ -144,6 +146,33 @@ const w = await Winix.boot({
     point <code>proxyFetch</code> at it, for example <code>proxyFetch('https://proxy.example/?url=')</code>. A proxy that
     forwards any URL is an open relay, so restrict it to the hosts you need.</p>
 
+  <h2 id="sockets">Sockets</h2>
+  <p>Programs in the guest can open TCP and UDP sockets (AF_INET) and AF_UNIX sockets. There is no network card: the
+    page relays each AF_INET socket through the <code>net</code> transport you give to <code>boot()</code>. The
+    transport that ships is <code>wisp(url)</code>, a client for a
+    <a href="https://github.com/MercuryWorkshop/wisp-protocol">WISP</a> server, which makes the real connections. The
+    development server has one at <code>/__wisp</code>.</p>
+  <pre><code>import { Winix, wisp } from './winix.js';
+
+const w = await Winix.boot({ net: wisp('/__wisp') });
+await w.exec('wget -q -O - http://example.com/ | head -c 100');
+await w.exec('printf "HEAD / HTTP/1.0
+
+" | nc example.com 80');</code></pre>
+  <ul>
+    <li>DNS queries are answered in the page with stand-in addresses from <code>198.18.0.0/15</code>. Connecting to one
+      connects to the name it stands for, and the WISP server does the real lookup.</li>
+    <li>WISP does not confirm connections, so <code>connect()</code> succeeds at once. A refused or unreachable host
+      shows up as the error of the first <code>recv()</code>, in <code>poll()</code>, and in <code>SO_ERROR</code>.</li>
+    <li>Only outgoing connections: <code>listen()</code> fails with <code>EOPNOTSUPP</code>, and guest programs cannot
+      reach each other over <code>127.0.0.1</code> (use AF_UNIX). No IPv6, and <code>shutdown(SHUT_WR)</code> sends
+      nothing to the peer.</li>
+    <li>BusyBox <code>nc</code> and <code>wget</code> (HTTP only) are included. For HTTPS, use <code>curl</code>, which
+      goes through <code>fetch</code>.</li>
+    <li>A WISP server connects anywhere for anyone who can reach it. In production, run your own, restrict the hosts and
+      ports it allows, and pass its URL: <code>wisp('wss://relay.example/')</code>.</li>
+  </ul>
+
   <h2 id="curl">curl</h2>
   <p>Inside the guest, <code>curl</code> performs HTTP and HTTPS requests through the <code>fetch</code> function above.
     The flags it accepts:</p>
@@ -161,8 +190,8 @@ const w = await Winix.boot({
     <tr><td><code>-w FORMAT</code>, <code>--write-out FORMAT</code></td><td>Print after the transfer. Supports <code>%{http_code}</code> and <code>\n</code>.</td></tr>
     <tr><td><code>-L</code>, <code>-k</code>, <code>--location</code>, <code>--compressed</code></td><td>Accepted. Redirects are always followed.</td></tr>
   </table>
-  <p class="note">Anything else is an error. Sockets, <code>ssh</code>, <code>nc</code>, and <code>ping</code> are not
-    available in this release.</p>
+  <p class="note">Anything else is an error. For other protocols, use guest sockets (<a href="#sockets">Sockets</a>);
+    <code>ssh</code> and <code>ping</code> are not available in this release.</p>
 
   <h2 id="format">Session format</h2>
   <p>A <code>.winix</code> file is gzip-compressed. Once decompressed, it holds the magic string <code>WINIXS01</code>,
@@ -171,7 +200,6 @@ const w = await Winix.boot({
     only archives you trust. Nothing in the archive runs as code: it is validated before any machine starts.</p>
 
   <h2 id="not-yet">Not yet</h2>
-  <p>These are planned but not part of this release: network sockets inside the guest, <code>w.connect()</code>, and
-    <code>w.ping()</code>. Raw networking needs a kernel build with networking enabled and a process outside the browser
-    to carry the traffic.</p>
+  <p>These are planned but not part of this release: listening sockets and loopback between guest programs,
+    <code>w.connect()</code>, and <code>w.ping()</code>.</p>
 </main>

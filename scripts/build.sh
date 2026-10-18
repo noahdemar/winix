@@ -49,13 +49,20 @@ for c in llvm kernel musl busybox; do
   fi
 done
 
-# Our patches (patches/<component>/*.patch) go on top of upstream's; skipped when already applied.
+# Our patches (patches/<component>/*.patch) go on top of upstream's; skipped when already applied. Applied names are
+# recorded in .winix-patches, since a patch that a later one builds on no longer reverse-applies by itself.
 for c in kernel musl busybox; do
+  stamp="$LW_WORKSPACE/src/$c/.winix-patches"
+  touch "$stamp"
   for p in "$REPO"/patches/$c/*.patch; do
     [ -f "$p" ] || continue
-    if git -C "$LW_WORKSPACE/src/$c" apply --reverse --check "$p" >/dev/null 2>&1; then continue; fi
-    git -C "$LW_WORKSPACE/src/$c" apply "$p"
-    echo "applied $(basename "$p") to $c"
+    n="$(basename "$p")"
+    grep -qxF "$n" "$stamp" && continue
+    if ! git -C "$LW_WORKSPACE/src/$c" apply --reverse --check "$p" >/dev/null 2>&1; then
+      git -C "$LW_WORKSPACE/src/$c" apply "$p"
+      echo "applied $n to $c"
+    fi
+    echo "$n" >> "$stamp"
   done
 done
 

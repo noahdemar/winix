@@ -25,10 +25,33 @@ The filesystem persists between `exec` calls; shell variables do not (each call 
 queued and run one at a time. A timed-out command's process group is killed; the machine is only rebuilt if
 `winixd` itself stops answering.
 
-The guest has no sockets. `curl` (common flags: `-sSfLiIoOXHdAw`) asks the page to make the request with `fetch`,
+`curl` (common flags: `-sSfLiIoOXHdAw`) asks the page to make the request with `fetch`,
 so the browser's CORS rules apply. `proxyFetch()` sends cross-origin requests through `/__proxy?url=` on the dev
 server instead; in production, point it at your own proxy (`proxyFetch('https://proxy.example/?url=')`) or pass any
 `fetch`-compatible function.
+
+## Sockets
+
+The kernel has AF_INET TCP and UDP sockets (`patches/kernel/0005`, `arch/wasm/kernel/winixnet.c`) and AF_UNIX. There
+is no IP stack: each socket is a channel the page relays (`src/net.js`) through the `net` transport passed to boot, normally
+a [WISP](https://github.com/MercuryWorkshop/wisp-protocol) WebSocket server that makes the real connections:
+
+```js
+import { Winix, wisp } from './winix.js';
+const w = await Winix.boot({ net: wisp('/__wisp') }); // scripts/serve.mjs serves a WISP endpoint at /__wisp
+await w.exec('wget -q -O - http://example.com/ | head -c 100');
+```
+
+- DNS queries (UDP port 53, any address) are answered in the page with stand-in addresses from `198.18.0.0/15`;
+  connecting to one connects to the name it stands for, so the WISP server does the real lookup.
+- WISP does not acknowledge connections, so `connect()` succeeds at once and a refused or unreachable connection shows
+  up as the error of the first `recv()` (and in `poll()` and `SO_ERROR`). BusyBox `nc` treats that as a normal exit.
+- No `listen`/`accept` (EOPNOTSUPP), no loopback between guest programs over AF_INET (use AF_UNIX), no IPv6, no TCP
+  half-close (`shutdown(SHUT_WR)` sends nothing). BusyBox `nc` and `wget` (HTTP only) are enabled.
+- Without `net`, connections fail with ENETUNREACH. `/__wisp` makes connections for anyone who can reach it, so in
+  production point `wisp()` at your own server and restrict it.
+
+Focused check (no internet needed): `node tests/net.mjs` with the server above running.
 
 ## Packages
 
@@ -119,7 +142,7 @@ node scripts/serve.mjs dist 8000
 - http://127.0.0.1:8000/terminal.html is a full terminal (xterm.js; for vi, top, and so on).
 - http://127.0.0.1:8000/test.html runs the API test suite in the page; bench.html prints latency numbers.
 
-The server listens on localhost only, because `/__proxy` will fetch any URL.
+The server listens on localhost only, because `/__proxy` will fetch any URL and `/__wisp` will connect anywhere.
 
 ## Save and load a session
 
@@ -175,7 +198,8 @@ Changing only `src/` or `patches/runtime/` needs no rebuild: `scripts/copy-src.s
 Our changes on top of upstream live in `patches/`:
 
 - `kernel/`: a 256 KB user stack, max page order 14 (this fixed boot-time panics), and the `/dev/winix` device.
-  Also `CONFIG_FILE_LOCKING` (upstream disables it; sqlite, git and pip need it).
+  Also `CONFIG_FILE_LOCKING` (upstream disables it; sqlite, git and pip need it), and `CONFIG_NET`/`CONFIG_UNIX` with
+  host-relayed AF_INET sockets (see Sockets).
 - `musl/`: fixes the signal trampoline, which read `SA_SIGINFO`'s `info` pointer from address 8 instead of the
   signal frame, so every `sa_sigaction` handler trapped with a signature mismatch.
 - `busybox/`: vfork-safe clone callbacks, plus the applet config.

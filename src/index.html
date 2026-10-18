@@ -86,7 +86,7 @@ if ('serviceWorker' in navigator && !crossOriginIsolated) {
 }
 </script>
 <script type="module">
-import { Winix, proxyFetch } from './winix.js';
+import { Winix, proxyFetch, wisp } from './winix.js';
 
 const $ = (id) => document.getElementById(id);
 const examples = [
@@ -102,7 +102,7 @@ let hpos = 0;
 const el = (tag, cls, text) => Object.assign(document.createElement(tag), { className: cls, textContent: text });
 
 const t0 = performance.now();
-let w = await Winix.boot({ fetch: proxyFetch() }).catch((e) => {
+let w = await Winix.boot({ fetch: proxyFetch(), net: wisp('/__wisp') }).catch((e) => {
   $('status').textContent = 'boot failed: ' + e.message;
   throw e;
 });
@@ -214,6 +214,7 @@ $('loadfile').onchange = async () => {
   try {
     next = await Winix.restoreSession(file, {
       fetch: proxyFetch(),
+      net: wisp('/__wisp'),
       onProgress: (p) => note(`${p.phase} ${p.filesDone}/${p.filesTotal} files`),
     });
   } catch (e) {
