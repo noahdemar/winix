@@ -177,6 +177,9 @@ await w.exec('printf "HEAD / HTTP/1.0
       against Mozilla's root certificates in <code>/etc/ssl/cert.pem</code> (the <code>ca-certificates</code> package,
       installed with them). <code>boot()</code> sets the guest's clock, which starts at 1970, so certificate dates
       check correctly.</li>
+    <li><code>apt-get install -y pip</code> gives <code>pip</code>, which installs pure-Python packages from PyPI
+      (<code>pip install requests</code>). Packages with C extensions cannot load, since the guest has no
+      <code>dlopen</code>.</li>
     <li>A WISP server connects anywhere for anyone who can reach it. In production, run your own, restrict the hosts and
       ports it allows, and pass its URL: <code>wisp('wss://relay.example/')</code>.</li>
   </ul>

@@ -16,6 +16,13 @@ SQLITE_SHA256=aa73d8748095808471deaa8e6f34aa700e37f2f787f4425744f53fdd15a89c40
 build() {
 	fetch "$URL" "$SHA256" src.tgz
 	tar xzf src.tgz --strip-components=1
+	# subprocess: the guest has no fork()/vfork(), so children start through clone() (see the patch).
+	patch -p1 < "$REPO/packages/python-subprocess-clone.patch" >/dev/null || return 1
+	# The C recursion limit WASI builds use (500, not 10000): each level takes a few KiB of the Wasm stack, and with
+	# no guard page an overflow silently corrupts the memory below it (other processes', or the kernel's) instead of
+	# raising RecursionError.
+	sed -i 's/#  if defined(__wasi__)$/#  if defined(__wasi__) || defined(__wasm__)/' Include/cpython/pystate.h || return 1
+	[ "$(grep -c 'defined(__wasi__) || defined(__wasm__)' Include/cpython/pystate.h)" = 2 ] || return 1
 
 	# Host CPython for the cross build. Built in a clean environment so the guest cc wrapper and CC do not leak in.
 	if [ -n "${WINIX_HOST_PYTHON:-}" ]; then
@@ -74,12 +81,31 @@ build() {
 	rm -f python
 	make -j"$(nproc)" LDFLAGS="-L$ZLIB -L$SQLITE -L$OSSL/lib -Wl,-Bsymbolic" python || return 1
 	[ -x python ] || return 1
+	# sysconfig's build-time variables (_sysconfigdata__linux_.py), which pip and setuptools read.
+	make pybuilddir.txt >/dev/null || return 1
 
 	mkdir -p "$DEST/usr/bin" "$DEST/usr/lib/python3.12/lib-dynload" # no extension modules: lib-dynload stays empty
 	cp python "$DEST/usr/bin/python3" || return 1
 	"$WORK/bin/strip" "$DEST/usr/bin/python3" 2>/dev/null || true
-	# The standard library without test suites, tkinter, IDLE and the bundled pip wheel (ensurepip is disabled).
+	# A 4 MiB stack (patches/kernel/0006) instead of the default 256 KiB, which compiling a module under nested
+	# imports (pip importing tarfile) overflows. Appended after strip, which would drop the custom section.
+	python3 - "$DEST/usr/bin/python3" $((4 << 20)) <<'PY' || return 1
+import sys
+def leb(n):
+    out = bytearray()
+    while True:
+        b, n = n & 0x7F, n >> 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+name = b"winix.stack_size"
+body = leb(len(name)) + name + int(sys.argv[2]).to_bytes(4, "little")
+with open(sys.argv[1], "ab") as f:
+    f.write(b"\x00" + leb(len(body)) + body)
+PY
+	# The standard library without test suites, tkinter, IDLE and the bundled pip wheel (packages/pip.sh has pip).
 	cp -r Lib/. "$DEST/usr/lib/python3.12/"
 	rm -rf "$DEST"/usr/lib/python3.12/{test,idlelib,tkinter,turtledemo,ensurepip,lib2to3}
+	cp "$(cat pybuilddir.txt)"/_sysconfigdata_*.py "$DEST/usr/lib/python3.12/" || return 1
 	find "$DEST/usr/lib/python3.12" -name __pycache__ -prune -exec rm -rf {} +
 }

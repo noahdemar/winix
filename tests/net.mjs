@@ -144,6 +144,33 @@ try {
         out.push({ name: "page -> guest: guestFetch", ok: false, ms: performance.now() - t0, detail: String(e) });
       }
     }
+    if (havePython) {
+      await check("python subprocess (clone instead of fork)", w,
+        `python3 -c "import subprocess as s; print(s.run(['echo', 'child'], capture_output=True, text=True).stdout.strip());` +
+        ` print(s.run('exit 3', shell=True).returncode)\ntry: s.run(['no-such-program'])\nexcept FileNotFoundError: print('missing')"`,
+        (r) => r.stdout === "child\n3\nmissing\n");
+      const pip = await w.exec("apt-get install -y pip 2>&1 && echo INSTALLED", { timeoutMs: 180000 });
+      const havePip = pip.stdout.includes("INSTALLED");
+      out.push({ name: "apt-get install pip", ok: havePip, ms: pip.durationMs, detail: havePip ? "" : pip.stdout.slice(-400) });
+      if (havePip) {
+        // A minimal pure-Python wheel, built in the guest, so no package index is needed.
+        await w.writeFile("/work/mkwheel.py", [
+          "import base64, hashlib, zipfile",
+          "files = {'hello_winix/__init__.py': b'GREETING = \"hello from a wheel\"\\n',",
+          "  'hello_winix-1.0.dist-info/METADATA': b'Metadata-Version: 2.1\\nName: hello-winix\\nVersion: 1.0\\n',",
+          "  'hello_winix-1.0.dist-info/WHEEL': b'Wheel-Version: 1.0\\nGenerator: winix\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n'}",
+          "rec = ''.join(f'{n},sha256={base64.urlsafe_b64encode(hashlib.sha256(d).digest()).rstrip(b\"=\").decode()},{len(d)}\\n' for n, d in files.items())",
+          "with zipfile.ZipFile('/work/hello_winix-1.0-py3-none-any.whl', 'w') as z:",
+          "    for n, d in files.items(): z.writestr(n, d)",
+          "    z.writestr('hello_winix-1.0.dist-info/RECORD', rec + 'hello_winix-1.0.dist-info/RECORD,,\\n')",
+        ].join("\n"));
+        await check("pip: install, import, uninstall a local wheel", w,
+          "python3 /work/mkwheel.py && pip install -q /work/hello_winix-1.0-py3-none-any.whl && " +
+          "python3 -c 'import hello_winix; print(hello_winix.GREETING)' && pip uninstall -y -q hello-winix && " +
+          "python3 -c 'import hello_winix' 2>/dev/null || echo gone",
+          (r) => r.stdout === "hello from a wheel\ngone\n", { timeoutMs: 120000 });
+      }
+    }
     {
       let errno = 0;
       try { w.connect(9999); } catch (e) { errno = e.errno; }

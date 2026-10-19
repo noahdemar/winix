@@ -61,6 +61,13 @@ await w.exec('wget -q -O - http://example.com/ | head -c 100');
 - TLS runs in the guest: `apt-get install -y python` gives Python's `ssl` (OpenSSL 3.5, statically linked), and
   `openssl` gives `openssl s_client`; both verify against Mozilla's roots in `/etc/ssl/cert.pem`. The page sets the
   guest's clock at boot (`date -s`), since it starts at 1970 and certificates would look not yet valid.
+- `apt-get install -y pip` gives `pip` (and `python`), which installs pure-Python packages from PyPI:
+  `pip install requests` works. Packages with C extensions cannot load (no `dlopen`); pip picks no binary wheels,
+  since the guest's platform tag (`linux_wasm32`) matches none. Python's `subprocess` works (through `clone()`; there
+  is no `fork()`), except with `preexec_fn`.
+- Known issue (not from sockets; it reproduces on the kernel from before them): after many large Python processes
+  in one session (a dozen `pip install`s, or 25 runs of `compileall` over the standard library), memory can get
+  corrupted, and a process dies with `Illegal instruction` or the kernel panics in its VMA tree. `reset()` recovers.
 - Without `net`, connections fail with ENETUNREACH. `/__wisp` makes connections for anyone who can reach it, so in
   production point `wisp()` at your own server and restrict it.
 
@@ -73,8 +80,9 @@ Focused check (no internet needed): `node tests/net.mjs` with the server above r
 1. **Native (fast):** wasm builds from the recipes in `packages/`. `apt-get install -y sqlite` downloads
    `pkgs/sqlite_<ver>_<hash>.tar.gz` from next to the page (the guest's `winix://` URLs), checks its SHA-256 against
    `pkgs/index.txt`, and unpacks it at `/`. Archive names include a content hash, so browsers cache them forever.
-   Available: `sqlite` (sqlite3), `lua`, `jq`, `zlib`, `python` (CPython 3.12 with `ssl` and `sqlite3`), `openssl`,
-   `ca-certificates`, `blink`. Dependencies are installed first (`python` and `openssl` bring `ca-certificates`).
+   Available: `sqlite` (sqlite3), `lua`, `jq`, `zlib`, `python` (CPython 3.12 with `ssl` and `sqlite3`), `pip`,
+   `openssl`, `ca-certificates`, `blink`. Dependencies are installed first (`pip` brings `python`, and `python` and
+   `openssl` bring `ca-certificates`).
 2. **Fallback (broad, slower):** anything else is resolved against Alpine Linux's x86-64 repositories (`main` and
    `community`, with dependencies), unpacked into `/opt/x86`, and given a wrapper in `/usr/bin` that runs it under
    [Blink](https://github.com/jart/blink), an x86-64 Linux user-mode emulator built as a winix package. So
@@ -213,14 +221,19 @@ Our changes on top of upstream live in `patches/`:
 
 - `kernel/`: a 256 KB user stack, max page order 14 (this fixed boot-time panics), and the `/dev/winix` device.
   Also `CONFIG_FILE_LOCKING` (upstream disables it; sqlite, git and pip need it), and `CONFIG_NET`/`CONFIG_UNIX` with
-  host-relayed AF_INET sockets (see Sockets).
+  host-relayed AF_INET sockets (see Sockets). A program can ask for a larger stack with a `winix.stack_size` custom
+  section (python3 asks for 4 MiB, paired with CPython's WASI C recursion limit of 500, so deep recursion raises
+  `RecursionError` instead of running off the stack); brk no longer shares the stack's area. Read-only `MAP_SHARED`
+  mappings of regular files become private copies, since ramfs can only share contiguous pages (pip's HTTP cache).
 - `musl/`: fixes the signal trampoline, which read `SA_SIGINFO`'s `info` pointer from address 8 instead of the
   signal frame, so every `sa_sigaction` handler trapped with a signature mismatch.
 - `busybox/`: vfork-safe clone callbacks, plus the applet config.
 - `quickjs/`: a port that runs without worker threads and with a small stack.
 - `runtime/`: console output is sequenced across Web Workers and decoded as one byte stream; host side of
   `/dev/winix`; the exception tag packages use for `longjmp`; and signal delivery no longer crashes programs that
-  never call `clone()` (it called their missing `__set_tls_base`).
+  never call `clone()` (it called their missing `__set_tls_base`). A `clone()` child or thread no longer re-applies
+  the program's data relocations, which reset relocated pointers in the parent's live memory (CPython's float
+  formatting pool, among others) and corrupted its heap.
 
 `guest/` holds `winixd`, `curl` and the `/init` that starts `winixd`; `guest/winix-proto.h` defines the frame
 format shared with `src/winix.js`.

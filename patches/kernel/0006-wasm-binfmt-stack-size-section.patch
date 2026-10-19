@@ -1,0 +1,71 @@
+diff --git a/fs/binfmt_wasm.c b/fs/binfmt_wasm.c
+--- a/fs/binfmt_wasm.c
++++ b/fs/binfmt_wasm.c
+@@ -171,6 +171,43 @@
+ 	return !(chunk & 0x80);
+ }
+ 
++/* Upper bound for a stack a module asks for (wasm_stack_size). */
++#define WASM_STACK_MAX		(16UL * 1024 * 1024)
++
++/*
++ * A module may ask for a larger stack than WASM_STACK_SIZE with a custom section named "winix.stack_size" holding a
++ * little-endian u32 (bytes), as ELF programs do with PT_GNU_STACK on nommu: deep recursion, such as CPython compiling
++ * under nested imports, overflows the default and corrupts the memory below it. Walks the section headers of the
++ * mapped file [start, end).
++ */
++static unsigned long wasm_stack_size(unsigned long start, unsigned long end)
++{
++	static const char name[] = "winix.stack_size";
++	char buf[sizeof(name) - 1];
++	unsigned long p = start + 8, q, next; /* past the magic and version */
++	unsigned int size, name_len;
++	__le32 req;
++	u8 id;
++
++	while (p < end) {
++		if (get_user(id, (u8 __user *)p))
++			break;
++		p++;
++		if (!wasm_consume_varU32_user(&p, &size, end - p))
++			break;
++		next = p + size;
++		if (next > end || next < p)
++			break;
++		q = p;
++		if (id == 0 && wasm_consume_varU32_user(&q, &name_len, next - q) && name_len == sizeof(buf) &&
++		    q + name_len + sizeof(req) <= next && !copy_from_user(buf, (void __user *)q, name_len) &&
++		    !memcmp(buf, name, name_len) && !copy_from_user(&req, (void __user *)(q + name_len), sizeof(req)))
++			return clamp(PAGE_ALIGN((unsigned long)le32_to_cpu(req)), WASM_STACK_SIZE, WASM_STACK_MAX);
++		p = next;
++	}
++	return WASM_STACK_SIZE;
++}
++
+ static int load_wasm_file(struct linux_binprm *bprm, unsigned long extra_stack)
+ {
+ 	unsigned long data_start = 0; /* Will contain data and bss */
+@@ -356,7 +393,7 @@
+ 	/*
+ 	 * Create a stack, and put the brk at the start of this area.
+ 	*/
+-	stack_size = PAGE_ALIGN(WASM_STACK_SIZE + extra_stack);
++	stack_size = PAGE_ALIGN(wasm_stack_size(whole_start, whole_end) + extra_stack);
+ 	current->mm->start_brk = vm_mmap(NULL, 0, stack_size,
+ 			PROT_READ|PROT_WRITE,
+ 			MAP_PRIVATE|MAP_ANONYMOUS|MAP_GROWSDOWN, 0);
+@@ -369,7 +406,13 @@
+ 	}
+ 	current->mm->brk = current->mm->start_brk; /* Already page aligned... */
+ #ifndef CONFIG_MMU
+-	current->mm->context.end_brk = current->mm->start_brk + stack_size;
++	/*
++	 * No room for brk: it would grow up from the bottom of this area while
++	 * the stack grows down from the top, and musl's malloc keeps its
++	 * metadata in brk memory, so a deep stack would overwrite it. With brk
++	 * unable to grow, malloc takes that memory from mmap instead.
++	 */
++	current->mm->context.end_brk = current->mm->start_brk;
+ #endif
+ 	current->mm->start_stack = current->mm->start_brk + stack_size;
+ 
