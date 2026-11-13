@@ -42,11 +42,32 @@
   nav button { font: 12.5px var(--mono); color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; cursor: pointer; }
   nav button:hover { border-color: var(--muted); }
   footer { margin-top: 20px; font-size: 13px; color: var(--muted); }
+  header { position: relative; }
+  #extras-open { position: absolute; top: -4px; right: 0; font: 12.5px var(--mono); color: var(--fg); background: transparent;
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; cursor: pointer; }
+  #extras-open:hover { border-color: var(--muted); }
+  #extras { position: fixed; inset: 0 0 0 auto; width: min(360px, 100vw); background: var(--bg); border-left: 1px solid var(--line);
+    box-shadow: -12px 0 32px rgb(0 0 0 / .08); padding: 20px 16px; overflow-y: auto; z-index: 10;
+    transform: translateX(100%); transition: transform .18s ease; visibility: hidden; }
+  #extras.open { transform: none; visibility: visible; }
+  #extras h2 { font: 600 14px var(--mono); margin: 0; display: flex; justify-content: space-between; align-items: center; }
+  #extras h2 button { font: 18px/1 system-ui; color: var(--muted); background: none; border: 0; cursor: pointer; padding: 2px 6px; }
+  #extras h2 button:hover { color: var(--fg); }
+  #extras > p { margin: 8px 0 4px; font-size: 13px; color: var(--muted); }
+  .extra { padding: 12px 0; border-top: 1px solid var(--line); display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; }
+  .extra b { font: 600 13.5px var(--mono); }
+  .extra span { font-size: 12px; color: var(--muted); }
+  .extra p { grid-column: 1 / -1; margin: 0; font-size: 13px; }
+  .extra button { grid-row: 1 / 3; grid-column: 2; align-self: center; font: 12.5px var(--mono); color: var(--fg);
+    background: transparent; border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; cursor: pointer; }
+  .extra button:hover:not(:disabled) { border-color: var(--muted); }
+  .extra button.installed { color: var(--accent); border-color: transparent; cursor: default; }
   footer a { color: inherit; }
 </style>
 <main>
   <header>
     <h1>winix</h1>
+    <button id="extras-open" class="keep" type="button" aria-controls="extras" aria-expanded="false">Extras</button>
     <p>A Linux kernel running in the browser as WebAssembly, with an API for running shell commands and managing files. <a href="api.html">API reference</a></p>
     <details>
       <summary>About this sandbox</summary>
@@ -77,6 +98,11 @@
   <p class="meta">Sessions save files only (not running programs or editor buffers, and not the terminal). Stop background
     writers and save editors first. Backups can contain secrets such as .env files and keys.</p>
   <div id="session-status" class="meta" role="status"></div>
+  <aside id="extras" aria-label="Extra packages">
+    <h2>Extras <button id="extras-close" class="keep" type="button" aria-label="Close">×</button></h2>
+    <p>Optional packages outside the core system. Each installs with <code>apt-get install</code>, along with what it needs.</p>
+    <div id="extras-list"></div>
+  </aside>
   <footer>Each command runs in a fresh <code>sh</code>; files persist. Full-screen programs (vi, top) need the <a href="terminal.html">terminal</a>.</footer>
 </main>
 <script>
@@ -86,7 +112,7 @@ if ('serviceWorker' in navigator && !crossOriginIsolated) {
 }
 </script>
 <script type="module">
-import { Winix, proxyFetch } from './winix.js';
+import { Winix, proxyFetch, wisp } from './winix.js';
 
 const $ = (id) => document.getElementById(id);
 const examples = [
@@ -102,7 +128,7 @@ let hpos = 0;
 const el = (tag, cls, text) => Object.assign(document.createElement(tag), { className: cls, textContent: text });
 
 const t0 = performance.now();
-let w = await Winix.boot({ fetch: proxyFetch() }).catch((e) => {
+let w = await Winix.boot({ fetch: proxyFetch(), net: wisp('/__wisp') }).catch((e) => {
   $('status').textContent = 'boot failed: ' + e.message;
   throw e;
 });
@@ -111,7 +137,7 @@ let busy = false;
 // One busy state for command runs, saves and loads: while busy, nothing else can be typed or started.
 const setBusy = (on) => {
   busy = on;
-  for (const b of document.querySelectorAll('button')) b.disabled = on;
+  for (const b of document.querySelectorAll('button:not(.keep)')) b.disabled = on;
   $('cmd').disabled = on;
   if (!on) $('cmd').focus();
 };
@@ -140,7 +166,7 @@ async function offerEssentials() {
   install.onclick = () => {
     if (busy || w !== me) return;
     box.remove();
-    run(`apt-get install -y ${names.join(' ')}`);
+    run(`apt-get install -y ${names.join(' ')}`, 300000);
   };
   skip.onclick = () => {
     if (busy) return;
@@ -153,7 +179,7 @@ async function offerEssentials() {
 }
 offerEssentials();
 
-async function run(cmd) {
+async function run(cmd, timeoutMs = 30000) {
   if (!cmd.trim() || busy) return;
   history.push(cmd);
   hpos = history.length;
@@ -162,7 +188,7 @@ async function run(cmd) {
   $('log').append(entry);
   setBusy(true);
   try {
-    const r = await w.exec(cmd, { timeoutMs: 30000 });
+    const r = await w.exec(cmd, { timeoutMs });
     if (r.stdout) entry.append(el('pre', 'stdout', r.stdout.replace(/\n$/, '')));
     if (r.stderr) entry.append(el('pre', 'stderr', r.stderr.replace(/\n$/, '')));
     const meta = [`${Math.round(r.durationMs)} ms`];
@@ -174,6 +200,7 @@ async function run(cmd) {
   }
   setBusy(false);
   entry.scrollIntoView({ block: 'nearest' });
+  if ($('extras').classList.contains('open')) refreshExtras();
 }
 
 // Session save/load: the archive is a filesystem snapshot (not running programs or editor buffers).
@@ -214,6 +241,7 @@ $('loadfile').onchange = async () => {
   try {
     next = await Winix.restoreSession(file, {
       fetch: proxyFetch(),
+      net: wisp('/__wisp'),
       onProgress: (p) => note(`${p.phase} ${p.filesDone}/${p.filesTotal} files`),
     });
   } catch (e) {
@@ -234,6 +262,76 @@ $('loadfile').onchange = async () => {
   note('session restored');
   setBusy(false);
 };
+
+// Extras: packages outside the core (the essentials above), listed in a side panel. Each name is a package in
+// pkgs/index.txt, with a file that proves it is installed; the version, size and dependencies come from the index.
+const extras = {
+  git: '/usr/bin/git',
+  numpy: '/usr/lib/python3.12/site-packages/numpy/__init__.py',
+  pandas: '/usr/lib/python3.12/site-packages/pandas/__init__.py',
+  pip: '/usr/bin/pip',
+  sqlite: '/usr/bin/sqlite3',
+  lua: '/usr/bin/lua',
+  openssl: '/usr/bin/openssl',
+};
+const extraButtons = {};
+const mb = (bytes) => bytes >= 1e6 ? (bytes / 1e6).toFixed(1) + ' MB' : Math.round(bytes / 1e3) + ' kB';
+async function listExtras() {
+  // index.txt lines: name version sha256 size deps(comma-separated, or -) description
+  const index = {};
+  try {
+    const text = await (await fetch('pkgs/index.txt')).text();
+    for (const line of text.split('\n')) {
+      const [name, version, , size, deps, ...desc] = line.split(' ');
+      if (name) index[name] = { version, size: +size, deps: deps === '-' ? [] : deps.split(','), desc: desc.join(' ') };
+    }
+  } catch {}
+  for (const name of Object.keys(extras)) {
+    const info = index[name];
+    if (!info) continue; // not published with this build
+    const row = el('div', 'extra');
+    const facts = [info.version, mb(info.size)];
+    if (info.deps.length) facts.push('needs ' + info.deps.join(', '));
+    const b = el('button', '', 'Install');
+    b.type = 'button';
+    b.onclick = () => {
+      if (busy || b.classList.contains('installed')) return;
+      run(`apt-get install -y ${name}`, 300000);
+    };
+    extraButtons[name] = b;
+    row.append(el('b', '', name), b, el('span', '', facts.join(' · ')), el('p', '', info.desc));
+    $('extras-list').append(row);
+  }
+}
+async function refreshExtras() {
+  const names = Object.keys(extraButtons);
+  if (!names.length || busy) return;
+  const me = w;
+  const r = await me.exec(names.map((n) => `test -e ${extras[n]} && echo ${n}`).join('; ') + '; true', { timeoutMs: 10000 })
+    .catch(() => null);
+  if (!r || w !== me) return;
+  const have = new Set(r.stdout.split('\n'));
+  for (const n of names) {
+    const b = extraButtons[n];
+    b.classList.toggle('installed', have.has(n));
+    b.textContent = have.has(n) ? 'Installed' : 'Install';
+  }
+}
+const extrasLoaded = listExtras();
+const showExtras = async (open) => {
+  $('extras').classList.toggle('open', open);
+  $('extras-open').setAttribute('aria-expanded', open);
+  if (open) {
+    await extrasLoaded;
+    refreshExtras();
+    $('extras-close').focus();
+  }
+};
+$('extras-open').onclick = () => showExtras(!$('extras').classList.contains('open'));
+$('extras-close').onclick = () => { showExtras(false); $('extras-open').focus(); };
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && $('extras').classList.contains('open')) { showExtras(false); $('extras-open').focus(); }
+});
 
 for (const ex of examples) {
   const b = el('button', '', ex.length > 34 ? ex.slice(0, 32) + '…' : ex);

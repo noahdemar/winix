@@ -34,6 +34,18 @@
   let user_executable_instance = null;
   let user_executable_imports = null;
 
+  /// Dynamic loading (dlopen, in guest/dl.c). winixDylink is the linker, src/dylink.js, served next to this file.
+  /// user_dylink is this process's linker, made at its first use; dl_error says why the last operation failed.
+  try {
+    importScripts("dylink.js");
+  } catch (error) {
+    console.error(error);
+  }
+  let user_dylink = null;
+  let dl_error = "";
+  /// Set while wasm_load_executable() is loading a clone()'s copy of its parent's image rather than a new image.
+  let loading_clone = false;
+
   /// Flag that a clone callback should be called instead of _start().
   let should_call_clone_callback = false;
 
@@ -175,6 +187,12 @@
       // kernel exits back to userland, which will termintate the user executable with a Trap.
       user_executable_instance = null;
       user_executable_imports = null;
+
+      user_dylink = null;
+      if (!loading_clone) {
+        // A new image: the main thread forgets the shared objects of whichever image last had this address.
+        port.postMessage({ method: "dso_reset", key: Number(data_start) });
+      }
     },
 
     /// Handle user mode return (e.g. from syscall) that should not proceed normally. (Not called on normal returns.)
@@ -440,11 +458,15 @@
 
       if (message.user_executable) {
         // We are in a new runner that should duplicate the user executable. Happens when someone calls clone().
+        loading_clone = true;
         host_callbacks.wasm_load_executable(
           message.user_executable.bin_start,
           message.user_executable.bin_end,
           message.user_executable.data_start,
           message.user_executable.table_start);
+        loading_clone = false;
+        // The shared objects the process had loaded when this task was created (see linux.js), to load here too.
+        user_executable_params.dso = message.user_executable.dso;
       }
 
       let import_object = {
@@ -543,6 +565,34 @@
         }
       };
 
+      /// This process's dynamic linker. Each shared object it links is reported to the main thread, which hands
+      /// the list to the Workers of later clone() children.
+      const user_dl = () => {
+        if (!user_dylink) {
+          const key = Number(user_executable_params.data_start);
+          user_dylink = winixDylink.create({
+            memory: memory,
+            table: user_executable_imports.env.__indirect_function_table,
+            main: user_executable_instance,
+            mainBase: key,
+            env: user_executable_imports.env,
+            bits: arch_bits,
+            onop: (op) => port.postMessage({ method: "dso_op", key: key, op: op }),
+          });
+        }
+        return user_dylink;
+      };
+
+      /// Writes text as a C string of at most capacity bytes; returns its length.
+      const put_cstring = (text, buffer, capacity) => {
+        if (capacity <= 0) return 0;
+        const encoded = text_encoder.encode(text).subarray(0, capacity - 1);
+        const memory_u8 = new Uint8Array(memory.buffer);
+        memory_u8.set(encoded, buffer);
+        memory_u8[buffer + encoded.length] = 0;
+        return encoded.length;
+      };
+
       const user_executable_setup = () => {
         const stack_pointer = vmlinux_instance.exports.get_user_stack_pointer();
         const tls_base = vmlinux_instance.exports.get_user_tls_base();
@@ -602,6 +652,72 @@
               ]);
             },
 
+            // Dynamic loading, for guest/dl.c (what the linker does is described in src/dylink.js). The guest reads
+            // a shared object's file into memory and asks what it needs: __winix_dl_info stores its memory size,
+            // memory alignment, table size and number of needed libraries at out, and __winix_dl_needed gives the
+            // name of one of those. It then allocates zeroed memory at base and calls __winix_dl_open, which links
+            // the object there, runs its relocations and constructors, and returns a handle (> 0). deps are the
+            // handles of its needed libraries. __winix_dl_sym stores the address of a symbol (a function pointer,
+            // for a function) at out; handle 0 searches the program and the objects opened with global set.
+            // Each returns -1 on failure, and __winix_dl_error then gives the reason.
+            __winix_dl_info: (bytes, length, out) => {
+              try {
+                const info = winixDylink.parse(new Uint8Array(memory.buffer, Number(bytes), Number(length)));
+                new Uint32Array(memory.buffer, Number(out), 4).set(
+                  [info.memorySize, info.memoryAlign, info.tableSize, info.needed.length]);
+                return 0;
+              } catch (error) {
+                dl_error = String(error.message || error);
+                return -1;
+              }
+            },
+            __winix_dl_needed: (bytes, length, index, buffer, capacity) => {
+              try {
+                const info = winixDylink.parse(new Uint8Array(memory.buffer, Number(bytes), Number(length)));
+                if (!(index >= 0 && index < info.needed.length)) throw new Error("no such needed library");
+                return put_cstring(info.needed[index], Number(buffer), Number(capacity));
+              } catch (error) {
+                dl_error = String(error.message || error);
+                return -1;
+              }
+            },
+            __winix_dl_open: (bytes, length, base, global, deps, deps_count) => {
+              let handle;
+              try {
+                bytes = Number(bytes);
+                handle = user_dl().open(
+                  new Uint8Array(memory.buffer).slice(bytes, bytes + Number(length)), Number(base), !!global,
+                  Array.from(new Int32Array(memory.buffer, Number(deps), deps_count)));
+              } catch (error) {
+                dl_error = String(error.message || error);
+                return -1;
+              }
+              // From here on guest code runs (relocations, constructors). Its traps, and the exceptions the host
+              // unwinds the program with (exec, signal return), must pass through.
+              user_dylink.init(handle);
+              return handle;
+            },
+            __winix_dl_sym: (handle, name, out) => {
+              let address;
+              try {
+                address = user_dl().sym(handle, get_cstring(memory, Number(name)));
+              } catch (error) {
+                dl_error = String(error.message || error);
+                return -1;
+              }
+              if (address === undefined) {
+                dl_error = "symbol not found";
+                return -1;
+              }
+              if (arch_bits == 32) {
+                new DataView(memory.buffer).setUint32(Number(out), address, true);
+              } else {
+                new DataView(memory.buffer).setBigUint64(Number(out), BigInt(address), true);
+              }
+              return 0;
+            },
+            __winix_dl_error: (buffer, capacity) => put_cstring(dl_error, Number(buffer), Number(capacity)),
+
             // To be correct, we should save AND restore these globals between the user instance and vmlinux instance:
             // __stack_pointer <-> __user_stack_pointer
             // __tls_base <-> __user_tls_base
@@ -652,7 +768,13 @@
         let woken = user_executable.then((user_module) => WebAssembly.instantiate(user_module, user_executable_imports));
 
         woken = woken.then((instance) => {
-          instance.exports.__wasm_apply_data_relocs();
+          // Data relocations patch absolute addresses into the process's (shared) data once per program image. A
+          // clone() (a vfork child or a new thread) shares the memory the parent already relocated and has since
+          // changed: applying them again would reset its relocated pointers (CPython's dtoa pool cursor, among
+          // others) behind its back.
+          if (!should_call_clone_callback) {
+            instance.exports.__wasm_apply_data_relocs();
+          }
           if (should_call_clone_callback) {
             // Note: __wasm_init_tls cannot be used as it would also re-initilize the _Thread_local variables' data. But
             // on a clone(), it is none of our business to do that. It's up to the libc to do that as part of pthreads.
@@ -661,6 +783,11 @@
             instance.exports.__set_tls_base(tls_base);
           }
           user_executable_instance = instance;
+          if (should_call_clone_callback && user_executable_params.dso) {
+            // The parent's function pointers into its shared objects are table indices: give this task's new table
+            // the same objects at the same indices. Their data is the parent's, already relocated and initialised.
+            user_dl().replay(user_executable_params.dso);
+          }
           return instance;
         });
 

@@ -40,6 +40,7 @@
   <nav>
     <a href="#boot">Boot</a><a href="#exec">exec</a><a href="#files">Files</a><a href="#keys">keyInput</a>
     <a href="#sessions">Sessions</a><a href="#lifecycle">Lifecycle</a><a href="#fetch">Network</a>
+    <a href="#sockets">Sockets</a>
     <a href="#curl">curl</a><a href="#format">Session format</a><a href="#not-yet">Not yet</a>
   </nav>
 
@@ -56,7 +57,8 @@ const w = await Winix.boot({ fetch: proxyFetch() });</code></pre>
     <tr><td><code>onLog</code></td><td>none</td><td>Receives host diagnostics (boot messages and runtime events).</td></tr>
     <tr><td><code>onConsole</code></td><td>none</td><td>Receives the guest console text, as it is printed.</td></tr>
     <tr><td><code>cmdline</code></td><td>built-in</td><td>Kernel command line.</td></tr>
-    <tr><td><code>fetch</code></td><td>the page's <code>fetch</code></td><td>Function used for every HTTP request the guest makes. See <a href="#fetch">Network</a>.</td></tr>
+    <tr><td><code>fetch</code></td><td>the page's <code>fetch</code></td><td>Function used for every HTTP request the guest's <code>curl</code> makes. See <a href="#fetch">Network</a>.</td></tr>
+    <tr><td><code>net</code></td><td>none</td><td>Transport for guest sockets, such as <code>wisp(url)</code>. Without one, connections fail with <code>ENETUNREACH</code>. See <a href="#sockets">Sockets</a>.</td></tr>
   </table>
 
   <h2 id="exec">exec</h2>
@@ -123,8 +125,8 @@ w2.hostState; // the object saved above</code></pre>
   </table>
 
   <h2 id="fetch">Network</h2>
-  <p>The guest has no sockets. Every HTTP request it makes is passed to the <code>fetch</code> function you give to
-    <code>boot()</code>. That function decides what happens to the request: it can forward it, log it, or refuse it.
+  <p>Every HTTP request made by the guest's <code>curl</code> is passed to the <code>fetch</code> function you give to
+    <code>boot()</code>. Guest sockets are separate; see <a href="#sockets">Sockets</a>. That function decides what happens to the request: it can forward it, log it, or refuse it.
     Requests are made with the page's origin and browser credentials, so treat that function as a security boundary.</p>
   <pre><code>import { Winix } from './winix.js';
 
@@ -144,6 +146,60 @@ const w = await Winix.boot({
     point <code>proxyFetch</code> at it, for example <code>proxyFetch('https://proxy.example/?url=')</code>. A proxy that
     forwards any URL is an open relay, so restrict it to the hosts you need.</p>
 
+  <h2 id="sockets">Sockets</h2>
+  <p>Programs in the guest can open TCP and UDP sockets (AF_INET) and AF_UNIX sockets. There is no network card: the
+    page relays each AF_INET socket through the <code>net</code> transport you give to <code>boot()</code>. The
+    transport that ships is <code>wisp(url)</code>, a client for a
+    <a href="https://github.com/MercuryWorkshop/wisp-protocol">WISP</a> server, which makes the real connections. The
+    development server has one at <code>/__wisp</code>.</p>
+  <pre><code>import { Winix, wisp } from './winix.js';
+
+const w = await Winix.boot({ net: wisp('/__wisp') });
+await w.exec('wget -q -O - http://example.com/ | head -c 100');
+await w.exec('printf "HEAD / HTTP/1.0
+
+" | nc example.com 80');</code></pre>
+  <ul>
+    <li>DNS queries are answered in the page with stand-in addresses from <code>198.18.0.0/15</code>. Connecting to one
+      connects to the name it stands for, and the WISP server does the real lookup.</li>
+    <li>WISP does not confirm connections, so <code>connect()</code> succeeds at once. A refused or unreachable host
+      shows up as the error of the first <code>recv()</code>, in <code>poll()</code>, and in <code>SO_ERROR</code>.</li>
+    <li>Guest programs can <code>listen()</code> and <code>accept()</code>. Connections to a listening port on
+      <code>127.x</code>, <code>0.0.0.0</code> or the guest's own <code>10.0.2.15</code> are paired in the page, and
+      <code>localhost</code> resolves to <code>127.0.0.1</code>. A <code>127.x</code> port that no guest program listens
+      on goes to the WISP server, which reaches its own machine's localhost.</li>
+    <li>No IPv6. Over WISP, <code>shutdown(SHUT_WR)</code> sends nothing to the peer; between guest sockets, and to the
+      page, it works.</li>
+    <li>BusyBox <code>nc</code> and <code>wget</code> (HTTP only) are included; <code>curl</code> does HTTPS through
+      <code>fetch</code>.</li>
+    <li>TLS runs in the guest's own programs: <code>apt-get install -y python</code> gives Python's <code>ssl</code>
+      (OpenSSL 3.5), and <code>apt-get install -y openssl</code> gives <code>openssl s_client</code>. Both verify
+      against Mozilla's root certificates in <code>/etc/ssl/cert.pem</code> (the <code>ca-certificates</code> package,
+      installed with them). <code>boot()</code> sets the guest's clock, which starts at 1970, so certificate dates
+      check correctly.</li>
+    <li><code>apt-get install -y pip</code> gives <code>pip</code>, which installs pure-Python packages from PyPI
+      (<code>pip install requests</code>). C extension modules load, but only ones built for winix: PyPI has no
+      binary wheels for the guest's platform, and the guest has no compiler.</li>
+    <li>A WISP server connects anywhere for anyone who can reach it. In production, run your own, restrict the hosts and
+      ports it allows, and pass its URL: <code>wisp('wss://relay.example/')</code>.</li>
+  </ul>
+
+  <h3 id="forwarding">Port forwarding</h3>
+  <p>The page can connect to a port a guest program listens on. Neither call waits for queued <code>exec</code> calls.</p>
+  <pre><code>await w.exec('python3 -m http.server 8080 &gt;/tmp/log 2&gt;&amp;1 &amp;');
+const res = await w.guestFetch(8080, '/index.html');   // a standard Response
+console.log(res.status, await res.text());
+
+const c = w.connect(6379);                             // a raw TCP stream
+c.write('PING
+');
+const { value } = await c.readable.getReader().read();</code></pre>
+  <table>
+    <tr><th>Method</th><th>Meaning</th></tr>
+    <tr><td><code>connect(port)</code></td><td>Returns <code>{ readable, write(data), shutdown(), close() }</code>: <code>readable</code> is a <code>ReadableStream</code> of <code>Uint8Array</code>, <code>write</code> takes a string or bytes, <code>shutdown()</code> makes the guest read EOF while it can still answer. Throws an error with <code>errno</code> 111 if nothing listens on the port.</td></tr>
+    <tr><td><code>guestFetch(port, path, options)</code></td><td>Sends one HTTP/1.1 request (<code>Connection: close</code>) and resolves to a <code>Response</code>. Options: <code>method</code>, <code>headers</code> (object), <code>body</code> (string or bytes), <code>timeoutMs</code> (default 30000).</td></tr>
+  </table>
+
   <h2 id="curl">curl</h2>
   <p>Inside the guest, <code>curl</code> performs HTTP and HTTPS requests through the <code>fetch</code> function above.
     The flags it accepts:</p>
@@ -161,8 +217,8 @@ const w = await Winix.boot({
     <tr><td><code>-w FORMAT</code>, <code>--write-out FORMAT</code></td><td>Print after the transfer. Supports <code>%{http_code}</code> and <code>\n</code>.</td></tr>
     <tr><td><code>-L</code>, <code>-k</code>, <code>--location</code>, <code>--compressed</code></td><td>Accepted. Redirects are always followed.</td></tr>
   </table>
-  <p class="note">Anything else is an error. Sockets, <code>ssh</code>, <code>nc</code>, and <code>ping</code> are not
-    available in this release.</p>
+  <p class="note">Anything else is an error. For other protocols, use guest sockets (<a href="#sockets">Sockets</a>);
+    <code>ssh</code> and <code>ping</code> are not available in this release.</p>
 
   <h2 id="format">Session format</h2>
   <p>A <code>.winix</code> file is gzip-compressed. Once decompressed, it holds the magic string <code>WINIXS01</code>,
@@ -171,7 +227,5 @@ const w = await Winix.boot({
     only archives you trust. Nothing in the archive runs as code: it is validated before any machine starts.</p>
 
   <h2 id="not-yet">Not yet</h2>
-  <p>These are planned but not part of this release: network sockets inside the guest, <code>w.connect()</code>, and
-    <code>w.ping()</code>. Raw networking needs a kernel build with networking enabled and a process outside the browser
-    to carry the traffic.</p>
+  <p>These are planned but not part of this release: <code>wget https</code>, IPv6, and <code>w.ping()</code>.</p>
 </main>

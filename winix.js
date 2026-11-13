@@ -1,7 +1,10 @@
 // winix host API: boots the linux-wasm kernel in a hidden iframe and talks to the guest's winixd over /dev/winix,
 // a binary channel (see guest/winix-proto.h for the frame format). Guest programs such as curl open their own
-// channels; their HTTP requests are made with the page's fetch (or the `fetch` passed to boot()).
+// channels; their HTTP requests are made with the page's fetch (or the `fetch` passed to boot()). Guest sockets are
+// channels too, relayed by net.js through the `net` transport passed to boot().
 
+import { GuestNet, SOCK_BIT } from './net.js';
+export { wisp } from './net.js';
 import { CHUNK, LIMITS, checkPath, cloneHostState, encodeArchive, hexOf, readArchive, sha256, validateManifest } from './session.js';
 
 const BOOT_CMDLINE =
@@ -113,8 +116,8 @@ const getAssets = (baseUrl, variant) => {
 
 /// One booted guest: iframe + channels to winixd and to guest clients (curl).
 class Machine {
-  constructor({ baseUrl, variant, onLog, onConsole, cmdline, fetch }) {
-    Object.assign(this, { baseUrl, variant, cmdline, fetch });
+  constructor({ baseUrl, variant, onLog, onConsole, cmdline, fetch, net }) {
+    Object.assign(this, { baseUrl, variant, cmdline, fetch, net });
     this.onLog = onLog || (() => {});
     this.onConsole = onConsole || (() => {});
     this.dead = null;
@@ -136,6 +139,7 @@ class Machine {
 
   destroy(reason = new Error('machine disposed')) {
     this.kill(reason);
+    this.guestNet?.dispose();
     window.removeEventListener('message', this.onMessage);
     this.iframe?.remove();
     this.iframe = null;
@@ -156,12 +160,17 @@ class Machine {
     this.os = await iframe.contentWindow.linux(
       new URL('linux-worker.js', this.baseUrl).href, this.variant, module, this.cmdline, initrd.slice(0),
       (t) => this.onLog(t), (d) => this.onConsole(d));
-    attachChannels(this.os, { fetch: this.fetch, baseUrl: this.baseUrl, onFrame: (...a) => this.onFrame(...a) });
+    this.guestNet = attachChannels(this.os, {
+      fetch: this.fetch, net: this.net, baseUrl: this.baseUrl, onFrame: (...a) => this.onFrame(...a),
+    });
     try {
       await ready;
     } finally {
       clearTimeout(timer);
     }
+    // The guest's wall clock starts at 1970; TLS certificate checks (and file times) need the real time.
+    await this.request(OP.EXEC, [10000, 4096, '/', `date -u -s @${Math.round(Date.now() / 1000)} >/dev/null`],
+      (op, r) => (op === RP.EXIT ? r.i32() : undefined), 10000 + BACKSTOP_MS);
   }
 
   onFrame(id, tag, op, r) {
@@ -207,9 +216,12 @@ class Machine {
 
 /// Routes the /dev/winix channels of a booted linux() instance. HTTP requests from guest programs (curl, apt) are
 /// made with `fetch`; winix://path URLs resolve against baseUrl, where the package repository (pkgs/) is served.
-/// Other frames go to onFrame(channelId, tag, op, reader).
-export function attachChannels(os, { fetch: fetchFn = (...a) => fetch(...a), baseUrl = document.baseURI, onFrame = () => {} } = {}) {
+/// Socket channels go to a GuestNet relaying through the `net` transport (returned; without one, connections fail with
+/// ENETUNREACH). Other frames go to onFrame(channelId, tag, op, reader).
+export function attachChannels(os, { fetch: fetchFn = (...a) => fetch(...a), net = null, baseUrl = document.baseURI,
+  onFrame = () => {} } = {}) {
   const channels = new Map(); // id -> Framer
+  const guestNet = new GuestNet({ send: os.winix.send, close: os.winix.close }, net);
   const serveFetch = async (id, tag, r) => {
     const send = (op, ...f) => os.winix.send(id, frame(tag, op, ...f));
     try {
@@ -244,12 +256,14 @@ export function attachChannels(os, { fetch: fetchFn = (...a) => fetch(...a), bas
   };
   os.winix.set_handler({
     data: (id, bytes) => {
+      if (id & SOCK_BIT) return guestNet.data(id, bytes);
       let c = channels.get(id);
       if (!c) channels.set(id, (c = new Framer((tag, op, r) => (op === OP.FETCH ? serveFetch(id, tag, r) : onFrame(id, tag, op, r)))));
       c.push(bytes);
     },
-    close: (id) => channels.delete(id),
+    close: (id) => (id & SOCK_BIT ? guestNet.close(id) : channels.delete(id)),
   });
+  return guestNet;
 }
 
 /// A fetch for Winix.boot({ fetch }) that sends cross-origin requests through a proxy endpoint (such as
@@ -416,10 +430,13 @@ async function restoreFs(m, manifest, payload, report) {
 
 export class Winix {
   /// Options: baseUrl (where vmlinux/initramfs/linux.js live), variant, onLog (host diagnostics), onConsole (guest
-  /// console text), cmdline, fetch (used for guest HTTP requests; default: the page's fetch).
+  /// console text), cmdline, fetch (used for guest HTTP requests; default: the page's fetch), net (a transport for guest
+  /// sockets such as wisp(url); default: none, so connections fail with ENETUNREACH).
   static async boot({ baseUrl = new URL('./', import.meta.url), variant = 'wasm32_nommu', onLog, onConsole,
-    cmdline = BOOT_CMDLINE, fetch: fetchFn = (...a) => fetch(...a) } = {}) {
-    const w = new Winix({ baseUrl: new URL(baseUrl, document.baseURI).href, variant, onLog, onConsole, cmdline, fetch: fetchFn });
+    cmdline = BOOT_CMDLINE, fetch: fetchFn = (...a) => fetch(...a), net = null } = {}) {
+    const w = new Winix({
+      baseUrl: new URL(baseUrl, document.baseURI).href, variant, onLog, onConsole, cmdline, fetch: fetchFn, net,
+    });
     await w.#newMachine();
     return w;
   }
@@ -576,6 +593,41 @@ export class Winix {
         (e) => { throw new Error(`readFile ${path}: ${e.message}`); }));
   }
 
+  /// Opens a TCP connection from the page to `port`, where a guest program listens (port forwarding). Returns
+  /// { readable (a ReadableStream of Uint8Array), write(data), shutdown(), close() }; throws if nothing listens there.
+  /// Not queued: it does not wait for exec calls.
+  connect(port) {
+    if (this.#disposed) throw new Error('Winix disposed');
+    const m = this.#machine;
+    if (!m || m.dead) throw new Error('machine is dead: ' + (m?.dead?.message ?? 'not started'));
+    return m.guestNet.connectToGuest(port);
+  }
+
+  /// Sends an HTTP/1.1 request to a server listening on `port` in the guest and resolves to a Response. Options: method,
+  /// headers (object), body (string or bytes), timeoutMs.
+  async guestFetch(port, path = '/', { method = 'GET', headers = {}, body, timeoutMs = 30000 } = {}) {
+    const c = this.connect(port);
+    const bytes = body === undefined ? null : typeof body === 'string' ? encoder.encode(body) : body;
+    let head = `${method} ${path} HTTP/1.1\r\nHost: localhost:${port}\r\nConnection: close\r\n`;
+    for (const [k, v] of Object.entries(headers)) head += `${k}: ${v}\r\n`;
+    if (bytes) head += `Content-Length: ${bytes.length}\r\n`;
+    c.write(head + '\r\n');
+    if (bytes) c.write(bytes);
+    const timer = setTimeout(() => c.close(), timeoutMs);
+    const chunks = [];
+    try {
+      for (const reader = c.readable.getReader(); ;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+    } finally {
+      clearTimeout(timer);
+      c.close();
+    }
+    return parseHttpResponse(concat(chunks), method);
+  }
+
   /// Replaces the machine with a freshly booted one (the filesystem is lost).
   reset() {
     if (this.#disposed) return Promise.reject(new Error('Winix disposed'));
@@ -588,6 +640,40 @@ export class Winix {
     this.#disposed = true;
     this.#machine?.destroy();
   }
+}
+
+/// Parses a whole HTTP/1.x response (read until the server closed the connection) into a Response.
+function parseHttpResponse(raw, method) {
+  let i = 0;
+  while (i + 3 < raw.length && !(raw[i] === 13 && raw[i + 1] === 10 && raw[i + 2] === 13 && raw[i + 3] === 10)) i++;
+  if (i + 3 >= raw.length) throw new Error('guestFetch: incomplete HTTP response from the guest');
+  const [statusLine, ...lines] = decoder.decode(raw.subarray(0, i)).split('\r\n');
+  const m = /^HTTP\/1\.[01] (\d{3})(?: (.*))?$/.exec(statusLine);
+  if (!m) throw new Error('guestFetch: bad status line: ' + statusLine.slice(0, 80));
+  const headers = new Headers();
+  for (const line of lines) {
+    const k = line.indexOf(':');
+    if (k > 0) headers.append(line.slice(0, k).trim(), line.slice(k + 1).trim());
+  }
+  let body = raw.subarray(i + 4);
+  if (/\bchunked\b/i.test(headers.get('transfer-encoding') ?? '')) {
+    const parts = [];
+    for (let o = 0; ;) {
+      const nl = body.indexOf(10, o);
+      if (nl < 0) break;
+      const size = parseInt(decoder.decode(body.subarray(o, nl)), 16);
+      if (!(size > 0)) break;
+      parts.push(body.subarray(nl + 1, nl + 1 + size));
+      o = nl + 1 + size + 2;
+    }
+    body = concat(parts);
+    headers.delete('transfer-encoding');
+  } else if (headers.has('content-length')) {
+    body = body.subarray(0, Number(headers.get('content-length')));
+  }
+  const status = Number(m[1]);
+  const empty = method === 'HEAD' || status === 204 || status === 304 || status < 200;
+  return new Response(empty ? null : body, { status: status < 200 ? 200 : status, statusText: m[2] ?? '', headers });
 }
 
 const concat = (cs) => {

@@ -1,6 +1,13 @@
-blink 1.1.0 975e67a3747dd94d28989ce25ab328cea180dd81b6ae2240de299ae1993495c0 192724 - x86-64 Linux user-mode emulator (blink), used by apt for packages without a wasm build
-jq 1.7.1 3f7d86a535d5ec89f231ac79132692a664f1425db57fdb0b3eaba0539f964850 940572 - jq, a command-line JSON processor
-lua 5.4.7 08380d265c08638b9ffff8785a35aff5c5039e409d37512bca951da3a478f6d1 157087 - Lua 5.4 scripting language interpreter
-python 3.12.8 407c191b65449524388e1ca1552ee59f972bbb931c5101dd5dff1c382462d11c 5839182 - Python 3.12 interpreter and standard library (sqlite3; no threads, no dynamic extension modules)
-sqlite 3.47.2 79346ec939f1e3697316908eb65f7d91270c35702965665014407bad644437e9 742700 - SQLite 3 database engine and sqlite3 command-line shell
-zlib 1.3.1 de58039bd56b919c3bd953dde4e375e70b4efc594d3b3ccf471f5db92bfcf1b1 71624 - zlib compression library, with headers
+blink 1.1.0 00fab28eea8820ab92cc5a0208ff4dab739f413a720ccab1222bf307910c4841 192758 - x86-64 Linux user-mode emulator (blink), used by apt for packages without a wasm build
+ca-certificates 2026.09.25 3f967dac05816f276e06e9af7c3ee0e3ded58a4a3c8850e3d6170bf0e6ef6402 108768 - Mozilla CA certificate bundle (/etc/ssl/cert.pem), for TLS in guest programs
+dltest 1 288696f95cdc4e309d0a6157ad2830ecb6b355c19d200ad8d60b5ffed21cb703 380743 - dlopen test program and shared objects (for tests/dlopen.mjs)
+git 2.56.1 7e01da095180f84e367c500a6a18b6ec4eb06cfac6278430072c63966ef32642 5359856 ca-certificates git version control, with https:// and http:// remotes (libcurl, OpenSSL)
+jq 1.7.1 dfecedf6f08ed42139a295719050c3f21ba692c01265a7cf96c9174944b494a1 940517 - jq, a command-line JSON processor
+lua 5.4.7 1cfb1ad0d1962aeeba92adf4284573f19a576e38dbe2c5c410a5434136c88d06 157126 - Lua 5.4 scripting language interpreter
+numpy 2.5.4 5d84aede21ae0d6f30dde9883514ffb5c769616807b9b5aedaa86e4f2f0490f9 4754832 python NumPy: arrays and numerical computing for Python (no BLAS: numpy's own, slower, linear algebra)
+openssl 3.5.9 a27a7585441fe6957ab610d9dcd2712417199004942bc374dd4d09a252b1dd90 4888946 ca-certificates OpenSSL TLS toolkit: the openssl program, and static libssl/libcrypto with headers
+pandas 3.1.1 c0de1ba28ad2088c8048b05205ca00544123288569f828ad317066ef1989ae56 9419173 numpy pandas: data frames and data analysis for Python (with python-dateutil, six and tzdata)
+pip 26.2.1 c5c93b69da9750ccd79539ae4f2b8b61847778c4bc3e454f236096fa2f69a25c 1644909 python pip, the Python package installer (pure-Python packages)
+python 3.12.8 eceb109b4387103cad76275a2a919cddd0b8936ba3e57ebcfc10e3285d7ddb74 7543948 ca-certificates Python 3.12 interpreter and standard library (sqlite3, ssl; C extension modules load with dlopen; no threads)
+sqlite 3.47.2 efd078e21c9b1320d119dfcd4c44f80cbc366a08435decd2a565a1d7c735e2d1 742736 - SQLite 3 database engine and sqlite3 command-line shell
+zlib 1.3.1 498c0bd947b0c3a3223c232078d417c9b9e32daddb80dbe28f0466819fc98217 70498 - zlib compression library, with headers

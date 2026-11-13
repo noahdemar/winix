@@ -78,8 +78,23 @@ const linux = async (worker_url, variant, vmlinux, boot_cmdline, initrd, log, co
     Atomics.store(locks._memory, locks[lock], 0);
   };
 
+  /// The shared objects each program image has loaded with dlopen(), as the operations its linker reported (see
+  /// src/dylink.js), keyed by the image's data address. Every task of a process runs in its own Worker with its own
+  /// function table, so a clone() child's Worker repeats them. An entry lasts until a new image is loaded at its
+  /// address, not just until the process exits.
+  const dso = new Map();
+
   /// Callbacks from Web Workers (each one representing one task).
   const message_callbacks = {
+    dso_reset: (message) => {
+      dso.delete(message.key);
+    },
+
+    dso_op: (message) => {
+      if (!dso.has(message.key)) dso.set(message.key, []);
+      dso.get(message.key).push(message.op);
+    },
+
     start_primary: (message) => {
       // CPU 0 has init_task which sits in static storage. After booting it becomes CPU 0's idle task. The runner will
       // in this special case tell us where it is so that we can register it.
@@ -116,6 +131,10 @@ const linux = async (worker_url, variant, vmlinux, boot_cmdline, initrd, log, co
     },
 
     create_and_run_task: (message) => {
+      if (message.user_executable) {
+        // A clone(): the new task's Worker must load the shared objects its process has loaded so far.
+        message.user_executable.dso = dso.get(message.user_executable.data_start);
+      }
       // ret_from_fork will make sure the task switch finishes.
       make_task(message.prev_task, message.new_task, message.name, message.user_executable);
     },
