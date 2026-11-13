@@ -16,7 +16,9 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; background: var(--bg); color: var(--fg); }
   body { font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  main { max-width: 760px; margin: 0 auto; padding: 56px 16px 40px; min-height: 100vh; display: flex; flex-direction: column; }
+  main { max-width: 760px; margin: 0 auto; padding: 40px 16px 24px; height: 100vh; height: 100dvh; display: flex; flex-direction: column; }
+  /* The page fits the window; the command log scrolls in its own box (the page scrolls only if the window is too short). */
+  @media (max-height: 560px) { main { height: auto; min-height: 100vh; } #log { flex: none; height: 320px; } }
   h1 { font: 600 20px/1 var(--mono); letter-spacing: -0.02em; margin: 0; }
   header p { margin: 10px 0 0; color: var(--muted); }
   header details { margin-top: 14px; color: var(--muted); }
@@ -27,21 +29,21 @@
   header b { color: var(--fg); font-weight: 600; }
   #status { font: 13px var(--mono); color: var(--muted); margin-top: 28px; }
   #status b { color: var(--accent); font-weight: 500; }
-  #log { flex: 1; margin-top: 12px; font: 13.5px/1.6 var(--mono); }
+  #log { flex: 1; min-height: 160px; overflow-y: auto; overscroll-behavior: contain; margin-top: 12px; font: 13.5px/1.6 var(--mono); }
   .entry { padding: 14px 0; border-top: 1px solid var(--line); }
   .cmd { white-space: pre-wrap; word-break: break-word; }
   .cmd::before { content: "$ "; color: var(--muted); }
   pre { margin: 6px 0 0; white-space: pre-wrap; word-break: break-word; font: inherit; }
   .stderr { color: var(--err); }
   .meta { margin-top: 6px; font-size: 12px; color: var(--muted); }
-  form { position: sticky; bottom: 0; background: var(--bg); padding: 12px 0 16px; border-top: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
+  form { background: var(--bg); padding: 12px 0 16px; border-top: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
   form span { font: 14px var(--mono); color: var(--muted); }
   input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: inherit; font: 14px var(--mono); padding: 6px 0; }
   input:disabled { opacity: .5; }
   nav { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 18px; }
   nav button { font: 12.5px var(--mono); color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; cursor: pointer; }
   nav button:hover { border-color: var(--muted); }
-  footer { margin-top: 20px; font-size: 13px; color: var(--muted); }
+  footer { margin-top: 12px; font-size: 13px; color: var(--muted); }
   header { position: relative; }
   #extras-open { position: absolute; top: -4px; right: 0; font: 12.5px var(--mono); color: var(--fg); background: transparent;
     border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; cursor: pointer; }
@@ -79,7 +81,9 @@
         <li><b>Network access is controlled.</b> Programs in the sandbox cannot connect to the internet on their own.
           Requests only go out when you allow them, and you can log or block them.</li>
         <li><b>Saved sessions.</b> A machine can be saved to a <code>.winix</code> file and loaded later. The archive is
-          validated before a machine boots.</li>
+          validated before a machine boots. Sessions save files only (not running programs or editor buffers, and
+          not the terminal), so stop background writers and save editors first. Backups can contain secrets such as
+          .env files and keys.</li>
       </ul>
     </details>
   </header>
@@ -91,12 +95,10 @@
     <input id="cmd" placeholder="type a command" disabled spellcheck="false" autocapitalize="off" aria-label="command">
   </form>
   <nav id="session">
-    <button id="save" type="button" disabled>Save Session</button>
+    <button id="save" type="button" disabled title="Saves files only, not running programs. Backups can contain secrets such as .env files and keys.">Save Session</button>
     <button id="load" type="button" disabled>Load Session</button>
     <input id="loadfile" type="file" accept=".winix" hidden>
   </nav>
-  <p class="meta">Sessions save files only (not running programs or editor buffers, and not the terminal). Stop background
-    writers and save editors first. Backups can contain secrets such as .env files and keys.</p>
   <div id="session-status" class="meta" role="status"></div>
   <aside id="extras" aria-label="Extra packages">
     <h2>Extras <button id="extras-close" class="keep" type="button" aria-label="Close">×</button></h2>
@@ -179,6 +181,7 @@ async function offerEssentials() {
 }
 offerEssentials();
 
+const toBottom = () => { $('log').scrollTop = $('log').scrollHeight; };
 async function run(cmd, timeoutMs = 30000) {
   if (!cmd.trim() || busy) return;
   history.push(cmd);
@@ -186,6 +189,7 @@ async function run(cmd, timeoutMs = 30000) {
   const entry = el('div', 'entry');
   entry.append(el('div', 'cmd', cmd));
   $('log').append(entry);
+  toBottom();
   setBusy(true);
   try {
     const r = await w.exec(cmd, { timeoutMs });
@@ -199,7 +203,7 @@ async function run(cmd, timeoutMs = 30000) {
     entry.append(el('pre', 'stderr', e.message));
   }
   setBusy(false);
-  entry.scrollIntoView({ block: 'nearest' });
+  toBottom();
   if ($('extras').classList.contains('open')) refreshExtras();
 }
 
