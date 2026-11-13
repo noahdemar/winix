@@ -1,0 +1,101 @@
+diff --git a/src/env/__init_tls.c b/src/env/__init_tls.c
+index a93141e..d3c0da4 100644
+--- a/src/env/__init_tls.c
++++ b/src/env/__init_tls.c
+@@ -128,6 +128,11 @@ static void static_init_tls(size_t *aux)
+ 		+ main_tls.offset
+ #endif
+ 		+ main_tls.size + main_tls.align
++#ifdef __wasm__
++		/* Room for a thread's copy of LLVM's thread-local data: see
++		 * pthread_create(). */
++		+ __builtin_wasm_tls_size() + __builtin_wasm_tls_align()
++#endif
+ 		+ MIN_TLS_ALIGN-1 & -MIN_TLS_ALIGN;
+ 
+ 	if (libc.tls_size > sizeof builtin_tls) {
+diff --git a/src/linux/clone.c b/src/linux/clone.c
+index e3e8aa0..736e57d 100644
+--- a/src/linux/clone.c
++++ b/src/linux/clone.c
+@@ -71,10 +71,17 @@ int __clone(int (*fn)(void *), void *stack, int flags, void *arg, ...)
+ 	pid_t *ptid = 0, *ctid = 0;
+ 	void  *tls = 0;
+ 
++	/*
++	 * A caller that sets any flag using ptid, tls or ctid passes all three
++	 * (clone() above and pthread_create(); posix_spawn() passes none). The
++	 * test used to be clone()'s own, which left tls and ctid out for
++	 * pthread_create()'s CLONE_SETTLS | CLONE_CHILD_CLEARTID: every thread
++	 * started with a null thread pointer.
++	 */
+ 	va_start(ap, arg);
+-	if (flags & (CLONE_PIDFD | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID))
++	if (flags & (CLONE_PIDFD | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID
++			| CLONE_SETTLS | CLONE_CHILD_CLEARTID)) {
+ 		ptid = va_arg(ap, pid_t *);
+-	if (flags & CLONE_CHILD_SETTID) {
+ 		tls = va_arg(ap, void *);
+ 		ctid = va_arg(ap, pid_t *);
+ 	}
+diff --git a/src/thread/pthread_create.c b/src/thread/pthread_create.c
+index 087f620..817d660 100644
+--- a/src/thread/pthread_create.c
++++ b/src/thread/pthread_create.c
+@@ -234,6 +234,35 @@ static void init_file_lock(FILE *f)
+ 	if (f && f->lock<0) f->lock = 0;
+ }
+ 
++#ifdef __wasm__
++/*
++ * On Wasm the compiler, not this libc, lays out thread-local data: a thread
++ * finds its copy at the __tls_base global, which the kernel gives a new task
++ * from clone()'s tls argument. __musl_tp, this libc's thread pointer, is one
++ * such variable. So a new thread needs a block of its own: the initial
++ * thread-local data, with __musl_tp set to its struct pthread. (Passing the
++ * struct pthread itself as tls, as other architectures do, only appears to
++ * work while __musl_tp is the program's one thread-local variable, at offset
++ * 0, where it aliases the struct's self pointer.)
++ *
++ * __wasm_init_tls() is the linker's: it copies the initial data to the block
++ * and points the calling thread at it, which is undone here. The caller has
++ * signals blocked, so no handler runs in between.
++ */
++void __wasm_init_tls(void *);
++uintptr_t __get_tls_base(void);
++void __set_tls_base(uintptr_t);
++
++static __attribute__((__noinline__)) void wasm_thread_tls(unsigned char *block, struct pthread *td)
++{
++	uintptr_t base = __get_tls_base();
++	size_t tp_offset = (uintptr_t)&__musl_tp - base;
++	__wasm_init_tls(block);
++	__set_tls_base(base);
++	*(uintptr_t *)(block + tp_offset) = (uintptr_t)td;
++}
++#endif
++
+ int __pthread_create(pthread_t *restrict res, const pthread_attr_t *restrict attrp, void *(*entry)(void *), void *restrict arg)
+ {
+ 	int ret, c11 = (attrp == __ATTRP_C11_THREAD);
+@@ -350,9 +379,19 @@ int __pthread_create(pthread_t *restrict res, const pthread_attr_t *restrict att
+ 	args->sig_mask[(SIGCANCEL-1)/8/sizeof(long)] &=
+ 		~(1UL<<((SIGCANCEL-1)%(8*sizeof(long))));
+ 
++#ifdef __wasm__
++	/* The thread's block of thread-local data, above the dtv slot at the
++	 * bottom of its TLS area (static_init_tls() made room for it). */
++	unsigned char *tls = tsd - libc.tls_size + 2*sizeof(void *);
++	tls += -(uintptr_t)tls & (__builtin_wasm_tls_align() - 1);
++	wasm_thread_tls(tls, new);
++#else
++	void *tls = TP_ADJ(new);
++#endif
++
+ 	__tl_lock();
+ 	if (!libc.threads_minus_1++) libc.need_locks = 1;
+-	ret = __clone((c11 ? start_c11 : start), stack, flags, args, &new->tid, TP_ADJ(new), &__thread_list_lock);
++	ret = __clone((c11 ? start_c11 : start), stack, flags, args, &new->tid, tls, &__thread_list_lock);
+ 
+ 	/* All clone failures translate to EAGAIN. If explicit scheduling
+ 	 * was requested, attempt it before unlocking the thread list so

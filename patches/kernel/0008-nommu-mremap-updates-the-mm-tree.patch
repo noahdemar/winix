@@ -1,0 +1,42 @@
+--- a/mm/nommu.c	2026-11-13 01:43:15.033453003 +0000
++++ b/mm/nommu.c	2026-11-13 01:43:15.042453003 +0000
+@@ -1563,6 +1563,8 @@
+ 			unsigned long flags, unsigned long new_addr)
+ {
+ 	struct vm_area_struct *vma;
++	unsigned long new_end;
++	VMA_ITERATOR(vmi, current->mm, addr);
+ 
+ 	/* insanity checks first */
+ 	old_len = PAGE_ALIGN(old_len);
+@@ -1589,8 +1591,28 @@
+ 	if (new_len > vma->vm_region->vm_end - vma->vm_region->vm_start)
+ 		return (unsigned long) -ENOMEM;
+ 
+-	/* all checks complete - do it */
+-	vma->vm_end = vma->vm_start + new_len;
++	/*
++	 * all checks complete - do it
++	 *
++	 * The mm tree maps address ranges to VMAs, so it has to follow the
++	 * VMA end. Left alone, a shrunk VMA stays in the tree over the range
++	 * it gave up: unmapping it then clears only its new range, and the rest
++	 * of the old one keeps pointing at the freed VMA, for exit_mmap() (or
++	 * the next lookup there) to use.
++	 */
++	new_end = vma->vm_start + new_len;
++	if (new_end < vma->vm_end) {
++		if (vma_iter_clear_gfp(&vmi, new_end, vma->vm_end, GFP_KERNEL))
++			return (unsigned long) -ENOMEM;
++		vma->vm_end = new_end;
++	} else if (new_end > vma->vm_end) {
++		/* the range it grows over is the rest of its own region */
++		vma_iter_config(&vmi, vma->vm_start, new_end);
++		if (vma_iter_prealloc(&vmi, vma))
++			return (unsigned long) -ENOMEM;
++		vma->vm_end = new_end;
++		vma_iter_store_overwrite(&vmi, vma);
++	}
+ 	return vma->vm_start;
+ }
+ 

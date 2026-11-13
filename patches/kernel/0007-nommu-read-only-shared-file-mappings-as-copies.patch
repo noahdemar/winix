@@ -1,0 +1,41 @@
+diff --git a/mm/nommu.c b/mm/nommu.c
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -1023,11 +1023,25 @@
+ 	struct vm_region *region;
+ 	struct rb_node *rb;
+ 	unsigned long capabilities, result;
++	bool privatised;
+ 	int ret;
+ 	VMA_ITERATOR(vmi, current->mm, 0);
+ 
+ 	*populate = 0;
+ 
++	/*
++	 * A read-only shared mapping of a regular file becomes a private copy.
++	 * ramfs (the guest's root) can share a file's pages only while they
++	 * happen to be contiguous, so such mappings otherwise fail with ENODEV
++	 * once a file is over a page. The copy reads the same, but does not
++	 * follow later writes to the file. Programs map files for reading this
++	 * way (pip's HTTP cache, which then deletes the file).
++	 */
++	privatised = file && S_ISREG(file_inode(file)->i_mode) &&
++		     (flags & MAP_TYPE) == MAP_SHARED && !(prot & PROT_WRITE);
++	if (privatised)
++		flags = (flags & ~MAP_TYPE) | MAP_PRIVATE;
++
+ 	/* decide whether we should attempt the mapping, and if so what sort of
+ 	 * mapping */
+ 	ret = validate_mmap_request(file, addr, len, prot, flags, pgoff,
+@@ -1035,6 +1049,11 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/* Always a real copy: not the file's own pages, which a truncate or
++	 * unlink could free while still mapped. */
++	if (privatised)
++		capabilities &= ~NOMMU_MAP_DIRECT;
++
+ 	/* we ignore the address hint */
+ 	addr = 0;
+ 	len = PAGE_ALIGN(len);

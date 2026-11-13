@@ -1,0 +1,70 @@
+--- a/Modules/_posixsubprocess.c	2024-12-03 13:42:41.000000000 -0500
++++ b/Modules/_posixsubprocess.c	2026-10-18 19:33:30.838832575 -0400
+@@ -771,6 +771,50 @@
+ }
+ 
+ 
++#ifdef __wasm__
++/* winix (Wasm, no MMU) has neither fork() nor vfork(). The child runs child_exec() through a clone() callback
++ * instead, sharing the parent's memory until it execs, as a vfork() child would. */
++#include <sched.h>
++
++struct winix_child_args {
++    char *const *exec_array;
++    char *const *argv;
++    char *const *envp;
++    const char *cwd;
++    int p2cread;
++    int p2cwrite;
++    int c2pread;
++    int c2pwrite;
++    int errread;
++    int errwrite;
++    int errpipe_read;
++    int errpipe_write;
++    int close_fds;
++    int restore_signals;
++    int call_setsid;
++    pid_t pgid_to_set;
++    gid_t gid;
++    Py_ssize_t extra_group_size;
++    const gid_t *extra_groups;
++    uid_t uid;
++    int child_umask;
++    const void *child_sigmask;
++    int *fds_to_keep;
++    Py_ssize_t fds_to_keep_len;
++    PyObject *preexec_fn;
++    PyObject *preexec_fn_args_tuple;
++};
++
++static int
++winix_child(void *arg)
++{
++    struct winix_child_args *a = arg;
++    child_exec(a->exec_array, a->argv, a->envp, a->cwd, a->p2cread, a->p2cwrite, a->c2pread, a->c2pwrite, a->errread, a->errwrite, a->errpipe_read, a->errpipe_write, a->close_fds, a->restore_signals, a->call_setsid, a->pgid_to_set, a->gid, a->extra_group_size, a->extra_groups, a->uid, a->child_umask, a->child_sigmask, a->fds_to_keep, a->fds_to_keep_len, a->preexec_fn, a->preexec_fn_args_tuple);
++    _exit(255);
++    return 0;
++}
++#endif
++
+ /* The main purpose of this wrapper function is to isolate vfork() from both
+  * subprocess_fork_exec() and child_exec(). A child process created via
+  * vfork() executes on the same stack as the parent process while the latter is
+@@ -801,6 +845,16 @@
+ 
+     pid_t pid;
+ 
++#ifdef __wasm__
++    if (preexec_fn != Py_None) {
++        /* It would run Python code in a child sharing this interpreter's memory. */
++        errno = ENOSYS;
++        return -1;
++    }
++    struct winix_child_args a = { exec_array, argv, envp, cwd, p2cread, p2cwrite, c2pread, c2pwrite, errread, errwrite, errpipe_read, errpipe_write, close_fds, restore_signals, call_setsid, pgid_to_set, gid, extra_group_size, extra_groups, uid, child_umask, child_sigmask, fds_to_keep, fds_to_keep_len, preexec_fn, preexec_fn_args_tuple };
++    return clone(winix_child, NULL, CLONE_VM | CLONE_VFORK | SIGCHLD, &a);
++#endif
++
+ #ifdef VFORK_USABLE
+     PyThreadState *vfork_tstate_save;
+     if (child_sigmask) {

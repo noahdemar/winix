@@ -1,0 +1,19 @@
+diff --git a/runtime/linux-worker.js b/runtime/linux-worker.js
+index db6f6ad..43663ec 100644
+--- a/runtime/linux-worker.js
++++ b/runtime/linux-worker.js
+@@ -652,7 +652,13 @@
+         let woken = user_executable.then((user_module) => WebAssembly.instantiate(user_module, user_executable_imports));
+ 
+         woken = woken.then((instance) => {
+-          instance.exports.__wasm_apply_data_relocs();
++          // Data relocations patch absolute addresses into the process's (shared) data once per program image. A
++          // clone() (a vfork child or a new thread) shares the memory the parent already relocated and has since
++          // changed: applying them again would reset its relocated pointers (CPython's dtoa pool cursor, among
++          // others) behind its back.
++          if (!should_call_clone_callback) {
++            instance.exports.__wasm_apply_data_relocs();
++          }
+           if (should_call_clone_callback) {
+             // Note: __wasm_init_tls cannot be used as it would also re-initilize the _Thread_local variables' data. But
+             // on a clone(), it is none of our business to do that. It's up to the libc to do that as part of pthreads.

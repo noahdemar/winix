@@ -1,0 +1,11 @@
+--- a/runtime/linux-worker.js
++++ b/runtime/linux-worker.js
+@@ -404,7 +404,7 @@
+             memory: memory,
+             __memory_base: new WebAssembly.Global({ value: 'i' + arch_bits, mutable: false }, Ulong(user_executable_params.data_start)),
+             __stack_pointer: new WebAssembly.Global({ value: 'i' + arch_bits, mutable: true }, stack_pointer),
+-            __indirect_function_table: new WebAssembly.Table({ initial: 4096, element: "anyfunc" }), // TODO: fix this!
++            __indirect_function_table: new WebAssembly.Table({ initial: 16384, element: "anyfunc" }), // TODO: fix this! Sized for CPython (dylink table 5456); a table this size costs 64 KiB.
+             __table_base: new WebAssembly.Global({ value: 'i' + arch_bits, mutable: false }, Ulong(user_executable_params.table_start)),
+             __table_base32: new WebAssembly.Global({ value: 'i32', mutable: false }, Number(user_executable_params.table_start)),
+ 

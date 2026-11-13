@@ -1,0 +1,26 @@
+diff --git a/arch/wasm/configs/wasm32_nommu_defconfig b/arch/wasm/configs/wasm32_nommu_defconfig
+index 52b34d131..df7523c6d 100644
+--- a/arch/wasm/configs/wasm32_nommu_defconfig
++++ b/arch/wasm/configs/wasm32_nommu_defconfig
+@@ -24,7 +24,7 @@ CONFIG_BINFMT_WASM=y
+ # CONFIG_USB_SUPPORT is not set
+ # CONFIG_VIRTIO_MENU is not set
+ # CONFIG_VHOST_MENU is not set
+-# CONFIG_FILE_LOCKING is not set
++CONFIG_FILE_LOCKING=y
+ # CONFIG_DNOTIFY is not set
+ # CONFIG_INOTIFY_USER is not set
+ # CONFIG_MISC_FILESYSTEMS is not set
+diff --git a/arch/wasm/configs/wasm64_nommu_defconfig b/arch/wasm/configs/wasm64_nommu_defconfig
+index e03c984ef..1addf8256 100644
+--- a/arch/wasm/configs/wasm64_nommu_defconfig
++++ b/arch/wasm/configs/wasm64_nommu_defconfig
+@@ -24,7 +24,7 @@ CONFIG_BINFMT_WASM=y
+ # CONFIG_USB_SUPPORT is not set
+ # CONFIG_VIRTIO_MENU is not set
+ # CONFIG_VHOST_MENU is not set
+-# CONFIG_FILE_LOCKING is not set
++CONFIG_FILE_LOCKING=y
+ # CONFIG_DNOTIFY is not set
+ # CONFIG_INOTIFY_USER is not set
+ # CONFIG_MISC_FILESYSTEMS is not set

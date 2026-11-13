@@ -1,0 +1,165 @@
+diff -urN a/arch/wasm/Kconfig b/arch/wasm/Kconfig
+--- a/arch/wasm/Kconfig	2026-11-13 02:12:18.989874004 +0000
++++ b/arch/wasm/Kconfig	2026-11-13 02:12:19.014874004 +0000
+@@ -25,6 +25,7 @@
+ 	select GENERIC_CPU_DEVICES
+ 	select GENERIC_CSUM
+ 	select GENERIC_ENTRY
++	select ARCH_HAS_SYSCALL_WRAPPER
+ 	select GENERIC_HWEIGHT
+ 	select GENERIC_IRQ_SHOW
+ 	select HAVE_SYSCALL_TRACEPOINTS
+diff -urN a/arch/wasm/include/asm/syscall.h b/arch/wasm/include/asm/syscall.h
+--- a/arch/wasm/include/asm/syscall.h	2026-11-13 02:12:18.992874004 +0000
++++ b/arch/wasm/include/asm/syscall.h	2026-11-13 02:12:19.014874004 +0000
+@@ -6,7 +6,7 @@
+ #include <uapi/linux/audit.h>
+ #include <asm/ptrace.h>
+ 
+-extern void (* const sys_call_table[])(void);
++extern long (* const sys_call_table[])(const struct pt_regs *);
+ 
+ struct task_struct;
+ 
+diff -urN a/arch/wasm/include/asm/syscall_wrapper.h b/arch/wasm/include/asm/syscall_wrapper.h
+--- a/arch/wasm/include/asm/syscall_wrapper.h	1970-01-01 00:00:00.000000000 +0000
++++ b/arch/wasm/include/asm/syscall_wrapper.h	2026-11-13 02:12:19.014874004 +0000
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * syscall_wrapper.h - Wasm specific wrappers to syscall definitions
++ *
++ * Based on arch/riscv/include/asm/syscall_wrapper.h
++ *
++ * A Wasm indirect call traps unless the callee has exactly the signature the
++ * call site names. A syscall table of the handlers themselves, called with
++ * however many arguments user space happened to pass, therefore traps (and
++ * takes the kernel down) whenever a libc passes fewer arguments than the
++ * handler declares, as C libraries do for fcntl(fd, F_GETFL) and the like.
++ * So every handler gets a wrapper of one signature, which takes its arguments
++ * from the saved registers.
++ */
++
++#ifndef _ASM_WASM_SYSCALL_WRAPPER_H
++#define _ASM_WASM_SYSCALL_WRAPPER_H
++
++#include <asm/ptrace.h>
++
++asmlinkage long __wasm_sys_ni_syscall(const struct pt_regs *);
++
++#define SC_WASM_REGS_TO_ARGS(x, ...)						\
++	__MAP(x,__SC_ARGS							\
++	      ,,regs->syscall_args[0],,regs->syscall_args[1]			\
++	      ,,regs->syscall_args[2],,regs->syscall_args[3]			\
++	      ,,regs->syscall_args[4],,regs->syscall_args[5])
++
++#define __SYSCALL_DEFINEx(x, name, ...)						\
++	asmlinkage long __wasm_sys##name(const struct pt_regs *regs);		\
++	static long __se_sys##name(__MAP(x,__SC_LONG,__VA_ARGS__));		\
++	static inline long __do_sys##name(__MAP(x,__SC_DECL,__VA_ARGS__));	\
++	asmlinkage long __wasm_sys##name(const struct pt_regs *regs)		\
++	{									\
++		return __se_sys##name(SC_WASM_REGS_TO_ARGS(x,__VA_ARGS__));	\
++	}									\
++	static long __se_sys##name(__MAP(x,__SC_LONG,__VA_ARGS__))		\
++	{									\
++		long ret = __do_sys##name(__MAP(x,__SC_CAST,__VA_ARGS__));	\
++		__MAP(x,__SC_TEST,__VA_ARGS__);					\
++		__PROTECT(x, ret,__MAP(x,__SC_ARGS,__VA_ARGS__));		\
++		return ret;							\
++	}									\
++	static inline long __do_sys##name(__MAP(x,__SC_DECL,__VA_ARGS__))
++
++#define SYSCALL_DEFINE0(sname)							\
++	SYSCALL_METADATA(_##sname, 0);						\
++	asmlinkage long __wasm_sys_##sname(const struct pt_regs *__unused);	\
++	asmlinkage long __wasm_sys_##sname(const struct pt_regs *__unused)
++
++#define COND_SYSCALL(name)							\
++	asmlinkage long __weak __wasm_sys_##name(const struct pt_regs *regs);	\
++	asmlinkage long __weak __wasm_sys_##name(const struct pt_regs *regs)	\
++	{									\
++		return sys_ni_syscall();					\
++	}
++
++#endif /* _ASM_WASM_SYSCALL_WRAPPER_H */
+diff -urN a/arch/wasm/kernel/syscall_table.c b/arch/wasm/kernel/syscall_table.c
+--- a/arch/wasm/kernel/syscall_table.c	2026-11-13 02:12:18.993874004 +0000
++++ b/arch/wasm/kernel/syscall_table.c	2026-11-13 02:12:19.014874004 +0000
+@@ -5,11 +5,33 @@
+ #include <asm/syscalls_wasm32.h>
+ #include <asm/syscall.h>
+ 
+-void (* const sys_call_table[__NR_syscalls])(void) = {
+-	[0 ... __NR_syscalls-1] = (void (*)(void))(void*)sys_ni_syscall,
++/* Every entry is a wrapper of one signature: see asm/syscall_wrapper.h. */
++asmlinkage long sys_ni_syscall(void);
++
++asmlinkage long __wasm_sys_ni_syscall(const struct pt_regs *__unused)
++{
++	return sys_ni_syscall();
++}
+ 
+ #undef __SYSCALL
+-#define __SYSCALL(nr, call) [nr] = (void (*)(void))(void*)(call),
++#define __SYSCALL(nr, call) asmlinkage long __wasm_##call(const struct pt_regs *);
++#include <asm/unistd.h>
++#ifndef CONFIG_64BIT
++	__SYSCALL(__NR_truncate64, sys_wasm32_truncate64)
++	__SYSCALL(__NR_ftruncate64, sys_wasm32_ftruncate64)
++	__SYSCALL(__NR_pread64, sys_wasm32_pread64)
++	__SYSCALL(__NR_pwrite64, sys_wasm32_pwrite64)
++	__SYSCALL(__NR_readahead, sys_wasm32_readahead)
++	__SYSCALL(__NR_fadvise64_64, sys_wasm32_fadvise64_64)
++	__SYSCALL(__NR_fallocate, sys_wasm32_fallocate)
++	__SYSCALL(__NR_sync_file_range, sys_wasm32_sync_file_range)
++#endif
++
++long (* const sys_call_table[__NR_syscalls])(const struct pt_regs *) = {
++	[0 ... __NR_syscalls-1] = __wasm_sys_ni_syscall,
++
++#undef __SYSCALL
++#define __SYSCALL(nr, call) [nr] = __wasm_##call,
+ #include <asm/unistd.h>
+ 
+ #ifndef CONFIG_64BIT
+diff -urN a/arch/wasm/kernel/traps.c b/arch/wasm/kernel/traps.c
+--- a/arch/wasm/kernel/traps.c	2026-11-13 02:12:18.994874004 +0000
++++ b/arch/wasm/kernel/traps.c	2026-11-13 02:12:19.014874004 +0000
+@@ -25,13 +25,15 @@
+ 	{									\
+ 		long syscall = n;						\
+ 		struct pt_regs *regs = current_pt_regs();			\
+-		void (*fn)(void);						\
++		long (*fn)(const struct pt_regs *);				\
+ 		long syscall_args[] = {__MAP(x,__SC_ARGS,__VA_ARGS__)};		\
+ 		bool restart;							\
+ 										\
+ 		_exception_enter(regs);						\
+ 										\
+ 		regs->syscall_nr = n;						\
++		/* Arguments user space did not pass read as zero. */		\
++		memset(regs->syscall_args, 0, sizeof(regs->syscall_args));	\
+ 		memcpy(regs->syscall_args, syscall_args, sizeof(syscall_args));	\
+ 		regs->syscall_ret = -ENOSYS;					\
+ 										\
+@@ -41,13 +43,13 @@
+ 					regs, syscall);				\
+ 										\
+ 				if (syscall >= 0 && syscall < __NR_syscalls) {	\
++					/*					\
++					 * One signature for every handler, so	\
++					 * the argument count user space used	\
++					 * cannot trap the indirect call.	\
++					 */					\
+ 					fn = sys_call_table[syscall];		\
+-					if (syscall == __NR_restart_syscall) {	\
+-						regs->syscall_ret = sys_restart_syscall(); \
+-					} else if (fn != (void (*)(void))(void*)sys_ni_syscall) { \
+-						regs->syscall_ret = ((long (*)(cast_args))(void*)fn) \
+-							(__MAP(x,__SC_ARGS,__VA_ARGS__)); \
+-					}					\
++					regs->syscall_ret = fn(regs);		\
+ 				}						\
+ 										\
+ 				syscall_exit_to_user_mode(regs);		\

@@ -1,0 +1,156 @@
+diff --git a/runtime/linux-worker.js b/runtime/linux-worker.js
+index 3831ef7..1ba5e2f 100644
+--- a/runtime/linux-worker.js
++++ b/runtime/linux-worker.js
+@@ -9,6 +9,8 @@
+   let locks = null;
+   /// Shared counter that orders console chunks across workers (see linux.js).
+   let console_seq = null;
++  /// Per-channel "host has data" flags for /dev/winix (indexed by channel id & 255), set by the main thread.
++  let winix_ready = null;
+   const text_decoder = new TextDecoder("utf-8");
+   const text_encoder = new TextEncoder();
+ 
+@@ -34,6 +36,7 @@
+ 
+   /// A messenger to synchronize with the main thread, as well as communicate how many bytes were read on the console.
+   let console_read_messenger = new Int32Array(new SharedArrayBuffer(4));
++  let winix_read_messenger = new Int32Array(new SharedArrayBuffer(4));
+ 
+   /// An exception type used to abort part of execution (useful for collapsing the call stack of user code).
+   class Trap extends Error {
+@@ -252,6 +255,29 @@
+       return count;
+     },
+ 
++    // Host callbacks used by the /dev/winix channel device (arch/wasm/kernel/winix.c). Binary-safe, one channel per open.
++
++    wasm_driver_winix_put: (id, buffer, count) => {
++      const data = new Uint8Array(memory.buffer).slice(buffer, buffer + count);
++      port.postMessage({ method: "winix_put", id: id, data: data }, [data.buffer]);
++      return count;
++    },
++
++    wasm_driver_winix_get: (id, buffer, count) => {
++      // Polled by the kernel while a reader waits: skip the round trip to the main thread unless it flagged data.
++      if (Atomics.load(winix_ready, id & 255) === 0) {
++        return 0;
++      }
++      Atomics.store(winix_read_messenger, 0, -2);
++      port.postMessage({ method: "winix_get", id: id, buffer: buffer, count: count, messenger: winix_read_messenger });
++      Atomics.wait(winix_read_messenger, 0, -2);
++      return Atomics.load(winix_read_messenger, 0);
++    },
++
++    wasm_driver_winix_close: (id) => {
++      port.postMessage({ method: "winix_close", id: id });
++    },
++
+     wasm_driver_hvc_get: (buffer, count) => {
+       // Reset lock. Using .store() for the memory barrier.
+       Atomics.store(console_read_messenger, 0, -1);
+@@ -295,6 +321,7 @@
+       memory = message.memory;
+       locks = message.locks;
+       console_seq = message.console_seq;
++      winix_ready = message.winix_ready;
+       switch_to_last_task = message.last_task; // Only defined for tasks and CPU 0 (init task).
+ 
+       if (message.user_executable) {
+diff --git a/runtime/linux.js b/runtime/linux.js
+index 02d3522..6c9366d 100644
+--- a/runtime/linux.js
++++ b/runtime/linux.js
+@@ -22,6 +22,24 @@ const linux = async (worker_url, variant, vmlinux, boot_cmdline, initrd, log, co
+   const console_pending = new Map();
+   const console_stats = { chunks: 0, out_of_order: 0, gap_skips: 0 };
+   let console_next = 0;
++
++  /// /dev/winix channels: host-to-guest byte queues per channel id, and a shared flag per (id & 255) telling polling
++  /// readers that a queue is non-empty (or closed). Guest-to-host bytes go to winix_handler.
++  const winix_ready = new Int32Array(new SharedArrayBuffer(256 * 4));
++  const winix_channels = new Map(); // id -> { queue: Uint8Array[], closed: bool }
++  let winix_handler = { data: () => {}, close: () => {} };
++  const winix_channel = (id) => {
++    let c = winix_channels.get(id);
++    if (!c) winix_channels.set(id, (c = { queue: [], closed: false }));
++    return c;
++  };
++  const winix_flag = (id) => {
++    let ready = 0;
++    for (const [other, c] of winix_channels) {
++      if ((other & 255) === (id & 255) && (c.queue.length > 0 || c.closed)) ready = 1;
++    }
++    Atomics.store(winix_ready, id & 255, ready);
++  };
+   let console_gap_timer = null;
+ 
+   const console_flush = () => {
+@@ -139,6 +157,37 @@ const linux = async (worker_url, variant, vmlinux, boot_cmdline, initrd, log, co
+       Atomics.notify(message.console_read_messenger, 0, 1);
+     },
+ 
++    winix_get: (message) => {
++      const c = winix_channel(message.id);
++      let n = 0;
++      if (c.queue.length === 0 && c.closed) {
++        n = -1;  // EOF
++      } else {
++        const memory_u8 = new Uint8Array(memory.buffer);
++        while (c.queue.length > 0 && n < message.count) {
++          const head = c.queue[0];
++          const take = Math.min(head.length, message.count - n);
++          memory_u8.set(head.subarray(0, take), message.buffer + n);
++          n += take;
++          if (take === head.length) c.queue.shift();
++          else c.queue[0] = head.subarray(take);
++        }
++      }
++      winix_flag(message.id);
++      Atomics.store(message.messenger, 0, n);
++      Atomics.notify(message.messenger, 0, 1);
++    },
++
++    winix_put: (message) => {
++      winix_handler.data(message.id, message.data);
++    },
++
++    winix_close: (message) => {
++      winix_channels.delete(message.id);
++      winix_flag(message.id);
++      winix_handler.close(message.id);
++    },
++
+     console_write: (message) => {
+       console_stats.chunks++;
+       if (message.seq !== console_next) {
+@@ -255,6 +304,7 @@ const linux = async (worker_url, variant, vmlinux, boot_cmdline, initrd, log, co
+       ...options,
+       method: "init",
+       console_seq: console_seq,
++      winix_ready: winix_ready,
+       variant: variant,
+       vmlinux: vmlinux,
+       memory: memory,
+@@ -277,6 +327,21 @@ const linux = async (worker_url, variant, vmlinux, boot_cmdline, initrd, log, co
+ 
+   return {
+     console_stats: console_stats,
++    /// /dev/winix: set_handler({ data(id, bytes), close(id) }), send(id, bytes), close(id) (guest reads EOF).
++    winix: {
++      set_handler: (handler) => {
++        winix_handler = handler;
++      },
++      send: (id, bytes) => {
++        if (bytes.length === 0) return;
++        winix_channel(id).queue.push(bytes);
++        winix_flag(id);
++      },
++      close: (id) => {
++        winix_channel(id).closed = true;
++        winix_flag(id);
++      },
++    },
+     key_input: (data) => {
+       const key_buffer = text_encoder.encode(data);  // Possibly UTF-8 (up to 16 bits).
+ 

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>winix bench</title>
+<pre id="out"></pre>
+<script type="module">
+// Quick latency numbers (one boot, ~20 s). Results in window.__bench; window.__done when finished.
+import { Winix } from './winix.js';
+
+const out = document.getElementById('out');
+const log = (s) => { out.textContent += s + '\n'; };
+const med = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
+const bench = (window.__bench = {});
+const N = 20;
+
+const t0 = performance.now();
+const cmdline = new URLSearchParams(location.search).get('cmdline') ?? undefined;
+const w = await Winix.boot({ cmdline });
+bench.bootMs = performance.now() - t0;
+
+const timeExec = async (cmd, reps = 5) => {
+  const ms = [];
+  for (let i = 0; i < reps; i++) {
+    const r = await w.exec(cmd);
+    if (r.exitCode !== 0) throw new Error(cmd + ' -> ' + r.exitCode + ' ' + r.stderr);
+    ms.push(r.durationMs);
+  }
+  return med(ms);
+};
+const loop = (body) => `i=0; while [ $i -lt ${N} ]; do ${body}; i=$((i+1)); done`;
+
+bench.execTrueMs = await timeExec('true');
+const spawn = await timeExec(loop('/bin/true'), 3);
+const builtin = await timeExec(loop(':'), 3);
+bench.spawnMs = (spawn - builtin) / N; // one fork+exec of busybox
+bench.qjsStartMs = ((await timeExec(loop("qjs -e ''"), 3)) - builtin) / N;
+const data = crypto.getRandomValues(new Uint8Array(65536));
+let t = performance.now();
+await w.writeFile('/work/b.bin', data);
+bench.write64KBMs = performance.now() - t;
+t = performance.now();
+await w.readFile('/work/b.bin');
+bench.read64KBMs = performance.now() - t;
+
+for (const [k, v] of Object.entries(bench)) log(`${k}: ${v.toFixed(1)}`);
+w.dispose();
+window.__done = true;
+</script>

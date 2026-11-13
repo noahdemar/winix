@@ -1,0 +1,28 @@
+diff --git a/src/process/_Fork.c b/src/process/_Fork.c
+index 9c07792..e3c9835 100644
+--- a/src/process/_Fork.c
++++ b/src/process/_Fork.c
+@@ -1,4 +1,5 @@
+ #include <unistd.h>
++#include <errno.h>
+ #include <signal.h>
+ #include "syscall.h"
+ #include "libc.h"
+@@ -32,7 +33,16 @@ pid_t _Fork(void)
+ 	sigset_t set;
+ 	__block_all_sigs(&set);
+ 	LOCK(__abort_lock);
+-#ifdef SYS_fork
++#ifdef __wasm__
++	/*
++	 * No fork() without an MMU: the kernel cannot copy an address space.
++	 * (The call below also passes clone() two of its five arguments, which
++	 * the Wasm kernel's typed syscall dispatch traps on, taking the whole
++	 * machine down.) Programs start children with posix_spawn() or a
++	 * clone(CLONE_VM | CLONE_VFORK) callback instead.
++	 */
++	ret = -ENOSYS;
++#elif defined(SYS_fork)
+ 	ret = __syscall(SYS_fork);
+ #else
+ 	ret = __syscall(SYS_clone, SIGCHLD, 0);

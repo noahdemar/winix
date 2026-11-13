@@ -1,0 +1,17 @@
+diff --git a/arch/wasm/Kconfig b/arch/wasm/Kconfig
+index 37dcf36c1..759437b30 100644
+--- a/arch/wasm/Kconfig
++++ b/arch/wasm/Kconfig
+@@ -123,4 +123,12 @@ config PGTABLE_LEVELS
+ 	int
+ 	default 2
+ 
++config ARCH_FORCE_MAX_ORDER
++	int
++	default 14
++	help
++	  NOMMU anonymous mappings need physically contiguous memory, so the
++	  largest allocation a process can make is limited by the maximum page
++	  order: 14 allows 64 MiB (the default of 10 only allows 4 MiB).
++
+ endmenu

@@ -1,0 +1,10 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<script src="linux.js"></script>
+<script>
+  // linux.js declares `const linux`, which is not a window property.
+  window.linux = linux;
+  const report = (message) => parent.postMessage({ winix: 'error', message: String(message) }, '*');
+  window.onerror = (message, src, line, col, error) => report((error && error.stack) || message);
+  window.addEventListener('unhandledrejection', (e) => report((e.reason && e.reason.stack) || e.reason));
+</script>
