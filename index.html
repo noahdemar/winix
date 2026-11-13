@@ -317,12 +317,12 @@ async function refreshExtras() {
     b.textContent = have.has(n) ? 'Installed' : 'Install';
   }
 }
-const extrasLoaded = listExtras();
+let extrasLoaded = null; // the list is fetched the first time the panel opens, not with the page
 const showExtras = async (open) => {
   $('extras').classList.toggle('open', open);
   $('extras-open').setAttribute('aria-expanded', open);
   if (open) {
-    await extrasLoaded;
+    await (extrasLoaded ??= listExtras());
     refreshExtras();
     $('extras-close').focus();
   }
