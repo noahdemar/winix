@@ -1,0 +1,22 @@
+#!/bin/sh
+# sudo for scripts and instructions that use it: everything in winix already runs as root, so this runs the command
+# as it is. Options that pick a user, keep the environment or ask for a password are accepted and ignored.
+shell=
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-u|-g|-p|-C|-D|-h|-r|-t|-T|-U) shift 2 ;;
+	-i|-s|--login|--shell) shell=1; shift ;;
+	-v|-k|-K|--validate|--reset-timestamp|--remove-timestamp) [ $# -eq 1 ] && exit 0; shift ;;
+	-V|--version) echo "sudo (winix shim: commands already run as root)"; exit 0 ;;
+	--) shift; break ;;
+	-?*) shift ;;
+	*) break ;;
+	esac
+done
+if [ $# -eq 0 ]; then
+	[ -n "$shell" ] && exec /bin/sh -l
+	echo "usage: sudo command [args...]" >&2
+	exit 1
+fi
+[ -n "$shell" ] && exec /bin/sh -c "$*"
+exec "$@"

@@ -267,11 +267,18 @@ export function attachChannels(os, { fetch: fetchFn = (...a) => fetch(...a), net
 }
 
 /// A fetch for Winix.boot({ fetch }) that sends cross-origin requests through a proxy endpoint (such as
-/// scripts/serve.mjs's /__proxy?url=), since most sites do not allow CORS.
-export const proxyFetch = (prefix = '/__proxy?url=') => (url, init) =>
-  new URL(url, location.href).origin === location.origin
-    ? fetch(url, init)
-    : fetch(prefix + encodeURIComponent(url), init);
+/// scripts/serve.mjs's /__proxy?url=), since most sites do not allow CORS. Where the page's host has no such
+/// endpoint (a static host such as GitHub Pages), requests go out directly, and reach the sites that allow CORS.
+export const proxyFetch = (prefix = '/__proxy?url=') => {
+  let proxied = null; // a promise: whether the endpoint exists (asked once, without a url: serve.mjs answers 400)
+  const hasProxy = () => (proxied ??= fetch(prefix.split('?')[0], { method: 'GET' })
+    .then((r) => r.status === 400 || r.ok)
+    .catch(() => false));
+  return async (url, init) =>
+    new URL(url, location.href).origin === location.origin || !(await hasProxy())
+      ? fetch(url, init)
+      : fetch(prefix + encodeURIComponent(url), init);
+};
 
 // ---- session filesystem: each function runs inside one queued operation and uses Machine.request only ----
 
